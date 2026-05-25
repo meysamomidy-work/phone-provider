@@ -46,6 +46,7 @@ OUTPUT_FETCHED_URL_COL = "Website Fetched URL"
 ENRICHMENT_COLS = (OUTPUT_PROVIDER_COL, OUTPUT_PHONE_COL, OUTPUT_FETCHED_URL_COL)
 
 SUPPORTED_INPUT_SUFFIXES = frozenset({".xlsx", ".xlsm", ".xls", ".csv"})
+DEFAULT_CSV_SEP = "|"
 
 
 def _find_website_column(df: pd.DataFrame, override: str | None) -> str:
@@ -178,8 +179,9 @@ def enrich_file(
     website_col: str | None,
     workers: int,
     timeout: float,
+    csv_sep: str = DEFAULT_CSV_SEP,
 ) -> None:
-    df = _read_table(input_path)
+    df = _read_table(input_path, csv_sep=csv_sep)
     col = _find_website_column(df, website_col)
     log.info("Input %s: %s rows, website column %r", input_path.name, len(df), col)
 
@@ -227,12 +229,86 @@ def enrich_file(
     )
 
 
-def _read_table(path: Path) -> pd.DataFrame:
+def _sniff_csv_delimiter(path: Path, *, encoding: str) -> str:
+    with open(path, newline="", encoding=encoding, errors="replace") as f:
+        sample = f.read(65536)
+    try:
+        return csv.Sniffer().sniff(sample, delimiters="|,;\t").delimiter
+    except csv.Error:
+        return DEFAULT_CSV_SEP
+
+
+def _read_csv(path: Path, *, sep: str = DEFAULT_CSV_SEP) -> pd.DataFrame:
+    """Read pipe-delimited (or other) dealer CSV exports."""
+    last_error: Exception | None = None
+
+    for encoding in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
+        attempts: list[tuple[str, str, str | None]] = [
+            (sep, "c", None),
+            (_sniff_csv_delimiter(path, encoding=encoding), "python", "warn"),
+            (",", "python", "warn"),
+            (";", "python", "warn"),
+            ("\t", "python", "warn"),
+        ]
+        seen: set[tuple[str, str, str | None]] = set()
+        for sep, engine, on_bad_lines in attempts:
+            key = (sep, engine, on_bad_lines)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            kwargs: dict[str, Any] = {
+                "filepath_or_buffer": path,
+                "dtype": str,
+                "encoding": encoding,
+                "sep": sep,
+                "engine": engine,
+            }
+            if on_bad_lines is not None:
+                kwargs["on_bad_lines"] = on_bad_lines
+
+            try:
+                df = pd.read_csv(**kwargs)
+                if sep != DEFAULT_CSV_SEP or engine != "c":
+                    log.info(
+                        "Parsed %s with encoding=%s, sep=%r, engine=%s",
+                        path.name,
+                        encoding,
+                        sep,
+                        engine,
+                    )
+                return df
+            except UnicodeDecodeError as exc:
+                last_error = exc
+                break
+            except pd.errors.ParserError as exc:
+                last_error = exc
+                log.debug(
+                    "CSV parse failed for %s (encoding=%s, sep=%r, engine=%s): %s",
+                    path.name,
+                    encoding,
+                    sep,
+                    engine,
+                    exc,
+                )
+                continue
+
+    msg = (
+        f"Could not parse CSV: {path}. "
+        "Common causes: wrong delimiter, extra unquoted separators in fields, or mixed encodings. "
+        f"Dealer files are expected to use {DEFAULT_CSV_SEP!r} by default; try --csv-sep if needed."
+    )
+    if last_error:
+        msg += f" Last error: {last_error}"
+    raise ValueError(msg) from last_error
+
+
+def _read_table(path: Path, *, csv_sep: str = DEFAULT_CSV_SEP) -> pd.DataFrame:
     suffix = path.suffix.lower()
     if suffix in (".xlsx", ".xlsm", ".xls"):
         return pd.read_excel(path, dtype=str)
     if suffix == ".csv":
-        return pd.read_csv(path, dtype=str)
+        return _read_csv(path, sep=csv_sep)
     raise ValueError(f"Unsupported input format: {path}")
 
 
@@ -289,6 +365,11 @@ def main() -> None:
         default=30.0,
         help="HTTP timeout per request in seconds (default: 30)",
     )
+    parser.add_argument(
+        "--csv-sep",
+        default=DEFAULT_CSV_SEP,
+        help=f"Column separator for .csv inputs (default: {DEFAULT_CSV_SEP!r})",
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -320,6 +401,7 @@ def main() -> None:
                 website_col=args.website_col,
                 workers=args.workers,
                 timeout=args.timeout,
+                csv_sep=args.csv_sep,
             )
         except Exception as exc:
             log.error("%s: %s", inp, exc)
