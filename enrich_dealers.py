@@ -45,6 +45,8 @@ OUTPUT_FETCHED_URL_COL = "Website Fetched URL"
 
 ENRICHMENT_COLS = (OUTPUT_PROVIDER_COL, OUTPUT_PHONE_COL, OUTPUT_FETCHED_URL_COL)
 
+SUPPORTED_INPUT_SUFFIXES = frozenset({".xlsx", ".xlsm", ".xls", ".csv"})
+
 
 def _find_website_column(df: pd.DataFrame, override: str | None) -> str:
     if override:
@@ -182,7 +184,7 @@ def enrich_file(
     log.info("Input %s: %s rows, website column %r", input_path.name, len(df), col)
 
     rows_with_url: list[tuple[int, str]] = []
-    for idx, val in df[website_col].items():
+    for idx, val in df[col].items():
         if normalize_dealer_url(str(val) if pd.notna(val) else ""):
             rows_with_url.append((idx, str(val)))
 
@@ -234,14 +236,37 @@ def _read_table(path: Path) -> pd.DataFrame:
     raise ValueError(f"Unsupported input format: {path}")
 
 
+def _collect_input_paths(path: Path) -> list[Path]:
+    """Return one file path, or all supported files in a directory."""
+    if path.is_file():
+        if path.suffix.lower() not in SUPPORTED_INPUT_SUFFIXES:
+            raise ValueError(
+                f"Unsupported input format: {path}. "
+                f"Supported: {', '.join(sorted(SUPPORTED_INPUT_SUFFIXES))}"
+            )
+        return [path]
+    if path.is_dir():
+        files = sorted(
+            p
+            for p in path.iterdir()
+            if p.is_file() and p.suffix.lower() in SUPPORTED_INPUT_SUFFIXES
+        )
+        if not files:
+            raise ValueError(
+                f"No supported files in directory: {path}. "
+                f"Supported: {', '.join(sorted(SUPPORTED_INPUT_SUFFIXES))}"
+            )
+        return files
+    raise FileNotFoundError(f"Input not found: {path}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Enrich dealer Excel/CSV with website provider and phone from dealer sites",
     )
     parser.add_argument(
-        "inputs",
-        nargs="+",
-        help="Excel (.xlsx) or CSV files with a Website column",
+        "input",
+        help="Excel (.xlsx) or CSV file, or a directory of those files",
     )
     parser.add_argument(
         "-o",
@@ -272,11 +297,12 @@ def main() -> None:
         format="%(levelname)s %(message)s",
     )
 
-    inputs = [Path(p) for p in args.inputs]
-    for p in inputs:
-        if not p.is_file():
-            log.error("File not found: %s", p)
-            sys.exit(1)
+    input_path = Path(args.input)
+    try:
+        inputs = _collect_input_paths(input_path)
+    except (FileNotFoundError, ValueError) as exc:
+        log.error("%s", exc)
+        sys.exit(1)
 
     if len(inputs) > 1 and args.output:
         log.error("--output is only valid with a single input file")
