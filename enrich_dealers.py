@@ -2,8 +2,8 @@
 """
 Enrich dealership Excel files with website provider and phone from dealer sites.
 
-Each successfully enriched dealership is appended to the output file immediately.
-Rows whose website cannot be fetched are dropped.
+Each dealership with a website URL is appended to the output file immediately.
+If the site cannot be loaded, provider and phone columns are left empty.
 """
 from __future__ import annotations
 
@@ -21,8 +21,8 @@ from openpyxl import Workbook
 from tqdm import tqdm
 
 from dealer_phone import extract_primary_phone
+from dealer_platforms import DEALER_PLATFORMS
 from website_provider import (
-    TARGET_PROVIDER_NAMES,
     detect_from_html,
     fetch_dealer_html,
     normalize_dealer_url,
@@ -41,12 +41,12 @@ WEBSITE_COLUMN_CANDIDATES = (
 
 OUTPUT_PROVIDER_COL = "Website Provider"
 OUTPUT_PHONE_COL = "Website Phone"
-OUTPUT_FETCHED_URL_COL = "Website Fetched URL"
 
-ENRICHMENT_COLS = (OUTPUT_PROVIDER_COL, OUTPUT_PHONE_COL, OUTPUT_FETCHED_URL_COL)
+ENRICHMENT_COLS = (OUTPUT_PROVIDER_COL, OUTPUT_PHONE_COL)
 
 SUPPORTED_INPUT_SUFFIXES = frozenset({".xlsx", ".xlsm", ".xls", ".csv"})
 DEFAULT_CSV_SEP = "|"
+ENRICHED_OUTPUT_DIR = "enriched"
 
 
 def _find_website_column(df: pd.DataFrame, override: str | None) -> str:
@@ -140,21 +140,28 @@ class IncrementalWriter:
         return self._count
 
 
-def _process_row(website: str, *, timeout: float) -> dict[str, Any] | None:
-    """Fetch dealer site; return enrichment fields or None to drop the row."""
+def _empty_enrichment() -> dict[str, str]:
+    return {
+        OUTPUT_PROVIDER_COL: "",
+        OUTPUT_PHONE_COL: "",
+    }
+
+
+def _process_row(website: str, *, timeout: float) -> tuple[dict[str, str], bool]:
+    """Fetch dealer site; return (enrichment fields, loaded)."""
     base = normalize_dealer_url(str(website) if website is not None else "")
     if not base:
-        return None
+        return _empty_enrichment(), False
 
     fetched = fetch_dealer_html(base, timeout=timeout)
     if not fetched:
-        log.debug("drop (fetch failed): %s", base)
-        return None
+        log.debug("site not loaded: %s", base)
+        return _empty_enrichment(), False
 
     final_url, html = fetched
     provider_match = detect_from_html(html, source_url=final_url)
     provider_name = ""
-    if provider_match and provider_match.display_name in TARGET_PROVIDER_NAMES:
+    if provider_match and provider_match.display_name in DEALER_PLATFORMS:
         provider_name = provider_match.display_name
 
     phone = extract_primary_phone(html) or ""
@@ -162,8 +169,7 @@ def _process_row(website: str, *, timeout: float) -> dict[str, Any] | None:
     return {
         OUTPUT_PROVIDER_COL: provider_name,
         OUTPUT_PHONE_COL: phone,
-        OUTPUT_FETCHED_URL_COL: final_url,
-    }
+    }, True
 
 
 def _build_output_row(df: pd.DataFrame, idx: int, enrichment: dict[str, Any]) -> dict[str, Any]:
@@ -198,11 +204,12 @@ def enrich_file(
     out_columns = _output_columns(df)
     writer = IncrementalWriter(output_path, out_columns)
 
-    dropped = 0
+    unloaded = 0
 
-    def task(item: tuple[int, str]) -> tuple[int, dict[str, Any] | None]:
+    def task(item: tuple[int, str]) -> tuple[int, dict[str, str], bool]:
         idx, url = item
-        return idx, _process_row(url, timeout=timeout)
+        enrichment, loaded = _process_row(url, timeout=timeout)
+        return idx, enrichment, loaded
 
     try:
         with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
@@ -213,19 +220,18 @@ def enrich_file(
                 desc="Dealer websites",
                 unit="site",
             ):
-                idx, result = fut.result()
-                if result is None:
-                    dropped += 1
-                    continue
+                idx, result, loaded = fut.result()
+                if not loaded:
+                    unloaded += 1
                 writer.append(_build_output_row(df, idx, result))
     finally:
         writer.close()
 
     log.info(
-        "Wrote %s line by line (%s rows kept, %s dropped: site not loaded)",
+        "Wrote %s (%s rows, %s with empty provider/phone: site not loaded)",
         output_path,
         writer.count,
-        dropped,
+        unloaded,
     )
 
 
@@ -336,6 +342,13 @@ def _collect_input_paths(path: Path) -> list[Path]:
     raise FileNotFoundError(f"Input not found: {path}")
 
 
+def _resolve_output_path(inp: Path, explicit_output: Path | None) -> Path:
+    """Place enriched files under an ``enriched/`` folder next to the input file."""
+    if explicit_output is not None:
+        return explicit_output
+    return inp.parent / ENRICHED_OUTPUT_DIR / f"{inp.stem}_enriched{inp.suffix}"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Enrich dealer Excel/CSV with website provider and phone from dealer sites",
@@ -347,7 +360,10 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        help="Output path (single input only). Default: <input>_enriched<ext>",
+        help=(
+            f"Output path (single input only). "
+            f"Default: {ENRICHED_OUTPUT_DIR}/<input>_enriched<ext> beside the input file"
+        ),
     )
     parser.add_argument(
         "--website-col",
@@ -389,11 +405,9 @@ def main() -> None:
         log.error("--output is only valid with a single input file")
         sys.exit(1)
 
+    explicit_out = Path(args.output) if args.output and len(inputs) == 1 else None
     for inp in inputs:
-        if args.output and len(inputs) == 1:
-            out = Path(args.output)
-        else:
-            out = inp.with_name(f"{inp.stem}_enriched{inp.suffix}")
+        out = _resolve_output_path(inp, explicit_out)
         try:
             enrich_file(
                 inp,

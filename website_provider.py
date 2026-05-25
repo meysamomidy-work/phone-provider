@@ -10,6 +10,8 @@ import re
 from dataclasses import dataclass
 from urllib.parse import urljoin, urlparse
 
+from dealer_platforms import DEALER_PLATFORMS, PLATFORM_DOMAINS
+
 log = logging.getLogger("website_provider")
 
 CHROME_UA = (
@@ -90,23 +92,9 @@ def _compile_rules(rules: list[ProviderRule]) -> list[tuple[ProviderRule, list[r
 
 
 # Canonical display names (used by enrich_dealers.py).
-TARGET_PROVIDER_NAMES: tuple[str, ...] = (
-    "DealerSync",
-    "Dealr.cloud",
-    "CarsForSale",
-    "DealerCenter",
-    "Dealer Car Search",
-    "AutoManager",
-    "Frazer DMS",
-    "VinSolutions",
-    "Tekion",
-    "DealerSocket",
-    "CDK Global",
-    "DealerOn",
-    "Dealer Inspire",
-)
+TARGET_PROVIDER_NAMES: tuple[str, ...] = DEALER_PLATFORMS
 
-PROVIDERS: list[ProviderRule] = [
+_DETAILED_PROVIDER_RULES: list[ProviderRule] = [
     ProviderRule(
         provider_id="dealersync",
         display_name="DealerSync",
@@ -357,6 +345,53 @@ PROVIDERS: list[ProviderRule] = [
         host_regexes=(r"^.*\.dealerinspire\.com$", r"^.*\.dealerinspire\.net$"),
     ),
 ]
+
+
+def _slugify_display_name(name: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+    return slug or "provider"
+
+
+def _rule_from_domains(
+    display_name: str,
+    domains: tuple[str, ...],
+    *,
+    extra_substrings: tuple[str, ...] = (),
+) -> ProviderRule:
+    html_substrings: list[str] = list(extra_substrings)
+    html_regexes: list[str] = []
+    host_regexes: list[str] = []
+    for domain in domains:
+        d = domain.lower()
+        html_substrings.append(d)
+        escaped = re.escape(d)
+        html_regexes.append(escaped)
+        host_regexes.append(rf"^.*\.{escaped}$")
+        host_regexes.append(rf"^{escaped}$")
+    return ProviderRule(
+        provider_id=_slugify_display_name(display_name),
+        display_name=display_name,
+        html_substrings=tuple(dict.fromkeys(html_substrings)),
+        html_regexes=tuple(dict.fromkeys(html_regexes)),
+        host_regexes=tuple(dict.fromkeys(host_regexes)),
+    )
+
+
+def _build_provider_rules() -> list[ProviderRule]:
+    detailed_names = {rule.display_name for rule in _DETAILED_PROVIDER_RULES}
+    rules = list(_DETAILED_PROVIDER_RULES)
+    for name in DEALER_PLATFORMS:
+        if name in detailed_names:
+            continue
+        domains = PLATFORM_DOMAINS.get(name)
+        if not domains:
+            log.debug("no domain signatures for platform %r", name)
+            continue
+        rules.append(_rule_from_domains(name, domains))
+    return rules
+
+
+PROVIDERS: list[ProviderRule] = _build_provider_rules()
 
 _COMPILED = _compile_rules(PROVIDERS)
 
