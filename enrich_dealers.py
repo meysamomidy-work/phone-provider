@@ -3,7 +3,7 @@
 Enrich dealership Excel files with website provider and phone from dealer sites.
 
 Every input row is written to the enriched output.
-Rows without a website, or where the site cannot be loaded, get empty provider and phone.
+Failed provider/phone lookups include a note in Website Enrichment Notes explaining why.
 """
 from __future__ import annotations
 
@@ -41,8 +41,14 @@ WEBSITE_COLUMN_CANDIDATES = (
 
 OUTPUT_PROVIDER_COL = "Website Provider"
 OUTPUT_PHONE_COL = "Website Phone"
+OUTPUT_NOTES_COL = "Website Enrichment Notes"
 
-ENRICHMENT_COLS = (OUTPUT_PROVIDER_COL, OUTPUT_PHONE_COL)
+ENRICHMENT_COLS = (OUTPUT_PROVIDER_COL, OUTPUT_PHONE_COL, OUTPUT_NOTES_COL)
+
+REASON_NO_WEBSITE = "No dealer website provided"
+REASON_SITE_NOT_LOADED = "Website could not be loaded"
+REASON_PROVIDER_NOT_FOUND = "Website provider not detected on site"
+REASON_PHONE_NOT_FOUND = "Phone number not found on website"
 
 SUPPORTED_INPUT_SUFFIXES = frozenset({".xlsx", ".xlsm", ".xls", ".csv"})
 DEFAULT_CSV_SEP = "|"
@@ -140,23 +146,56 @@ class IncrementalWriter:
         return self._count
 
 
-def _empty_enrichment() -> dict[str, str]:
+def _enrichment_notes(
+    *,
+    has_website: bool,
+    loaded: bool,
+    provider: str,
+    phone: str,
+) -> str:
+    """Human-readable reasons when provider and/or phone could not be enriched."""
+    if not has_website:
+        return REASON_NO_WEBSITE
+    if not loaded:
+        return REASON_SITE_NOT_LOADED
+
+    reasons: list[str] = []
+    if not provider:
+        reasons.append(REASON_PROVIDER_NOT_FOUND)
+    if not phone:
+        reasons.append(REASON_PHONE_NOT_FOUND)
+    return "; ".join(reasons)
+
+
+def _make_enrichment(
+    *,
+    provider: str = "",
+    phone: str = "",
+    has_website: bool = True,
+    loaded: bool = True,
+) -> dict[str, str]:
     return {
-        OUTPUT_PROVIDER_COL: "",
-        OUTPUT_PHONE_COL: "",
+        OUTPUT_PROVIDER_COL: provider,
+        OUTPUT_PHONE_COL: phone,
+        OUTPUT_NOTES_COL: _enrichment_notes(
+            has_website=has_website,
+            loaded=loaded,
+            provider=provider,
+            phone=phone,
+        ),
     }
 
 
 def _process_row(website: str, *, timeout: float) -> tuple[dict[str, str], bool]:
-    """Fetch dealer site; return (enrichment fields, loaded)."""
+    """Fetch dealer site; return (enrichment fields, site_loaded)."""
     base = normalize_dealer_url(str(website) if website is not None else "")
     if not base:
-        return _empty_enrichment(), False
+        return _make_enrichment(has_website=False, loaded=False), False
 
     fetched = fetch_dealer_html(base, timeout=timeout)
     if not fetched:
         log.debug("site not loaded: %s", base)
-        return _empty_enrichment(), False
+        return _make_enrichment(loaded=False), False
 
     final_url, html = fetched
     provider_match = detect_from_html(html, source_url=final_url)
@@ -166,10 +205,7 @@ def _process_row(website: str, *, timeout: float) -> tuple[dict[str, str], bool]
 
     phone = extract_primary_phone(html) or ""
 
-    return {
-        OUTPUT_PROVIDER_COL: provider_name,
-        OUTPUT_PHONE_COL: phone,
-    }, True
+    return _make_enrichment(provider=provider_name, phone=phone, loaded=True), True
 
 
 def _build_output_row(df: pd.DataFrame, idx: int, enrichment: dict[str, Any]) -> dict[str, Any]:
@@ -203,7 +239,7 @@ def enrich_file(
         if url:
             rows_with_url.append((idx, str(val)))
         else:
-            enrichments[idx] = _empty_enrichment()
+            enrichments[idx] = _make_enrichment(has_website=False, loaded=False)
             no_website += 1
 
     def task(item: tuple[int, str]) -> tuple[int, dict[str, str], bool]:
@@ -231,7 +267,10 @@ def enrich_file(
     writer = IncrementalWriter(output_path, out_columns)
     try:
         for idx in df.index:
-            row_enrichment = enrichments.get(idx, _empty_enrichment())
+            row_enrichment = enrichments.get(
+                idx,
+                _make_enrichment(has_website=False, loaded=False),
+            )
             writer.append(_build_output_row(df, idx, row_enrichment))
     finally:
         writer.close()
