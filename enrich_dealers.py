@@ -2,8 +2,8 @@
 """
 Enrich dealership Excel files with website provider and phone from dealer sites.
 
-Each dealership with a website URL is appended to the output file immediately.
-If the site cannot be loaded, provider and phone columns are left empty.
+Every input row is written to the enriched output.
+Rows without a website, or where the site cannot be loaded, get empty provider and phone.
 """
 from __future__ import annotations
 
@@ -191,46 +191,56 @@ def enrich_file(
     col = _find_website_column(df, website_col)
     log.info("Input %s: %s rows, website column %r", input_path.name, len(df), col)
 
+    if df.empty:
+        log.warning("No rows in %s", input_path.name)
+
+    enrichments: dict[int, dict[str, str]] = {}
     rows_with_url: list[tuple[int, str]] = []
+    no_website = 0
+
     for idx, val in df[col].items():
-        if normalize_dealer_url(str(val) if pd.notna(val) else ""):
+        url = normalize_dealer_url(str(val) if pd.notna(val) else "")
+        if url:
             rows_with_url.append((idx, str(val)))
-
-    if not rows_with_url:
-        log.warning("No rows with a usable website URL")
-        return
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    out_columns = _output_columns(df)
-    writer = IncrementalWriter(output_path, out_columns)
-
-    unloaded = 0
+        else:
+            enrichments[idx] = _empty_enrichment()
+            no_website += 1
 
     def task(item: tuple[int, str]) -> tuple[int, dict[str, str], bool]:
         idx, url = item
         enrichment, loaded = _process_row(url, timeout=timeout)
         return idx, enrichment, loaded
 
-    try:
+    unloaded = 0
+    if rows_with_url:
         with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
             futures = {pool.submit(task, item): item[0] for item in rows_with_url}
             for fut in tqdm(
                 as_completed(futures),
                 total=len(futures),
-                desc="Dealer websites",
+                desc=input_path.name,
                 unit="site",
             ):
-                idx, result, loaded = fut.result()
+                idx, enrichment, loaded = fut.result()
+                enrichments[idx] = enrichment
                 if not loaded:
                     unloaded += 1
-                writer.append(_build_output_row(df, idx, result))
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    out_columns = _output_columns(df)
+    writer = IncrementalWriter(output_path, out_columns)
+    try:
+        for idx in df.index:
+            row_enrichment = enrichments.get(idx, _empty_enrichment())
+            writer.append(_build_output_row(df, idx, row_enrichment))
     finally:
         writer.close()
 
     log.info(
-        "Wrote %s (%s rows, %s with empty provider/phone: site not loaded)",
+        "Wrote %s (%s rows: %s no website, %s site not loaded)",
         output_path,
         writer.count,
+        no_website,
         unloaded,
     )
 
@@ -342,11 +352,20 @@ def _collect_input_paths(path: Path) -> list[Path]:
     raise FileNotFoundError(f"Input not found: {path}")
 
 
-def _resolve_output_path(inp: Path, explicit_output: Path | None) -> Path:
-    """Place enriched files under an ``enriched/`` folder next to the input file."""
+def _enriched_output_root() -> Path:
+    """``enriched/`` at the current working directory (project root when run from there)."""
+    return Path.cwd() / ENRICHED_OUTPUT_DIR
+
+
+def _resolve_output_path(
+    inp: Path,
+    output_root: Path,
+    explicit_output: Path | None,
+) -> Path:
+    """Place enriched files under ``<cwd>/enriched/``, not beside the input file."""
     if explicit_output is not None:
         return explicit_output
-    return inp.parent / ENRICHED_OUTPUT_DIR / f"{inp.stem}_enriched{inp.suffix}"
+    return output_root / f"{inp.stem}_enriched{inp.suffix}"
 
 
 def main() -> None:
@@ -362,7 +381,7 @@ def main() -> None:
         "--output",
         help=(
             f"Output path (single input only). "
-            f"Default: {ENRICHED_OUTPUT_DIR}/<input>_enriched<ext> beside the input file"
+            f"Default: ./{ENRICHED_OUTPUT_DIR}/<input>_enriched<ext>"
         ),
     )
     parser.add_argument(
@@ -405,9 +424,10 @@ def main() -> None:
         log.error("--output is only valid with a single input file")
         sys.exit(1)
 
+    output_root = _enriched_output_root()
     explicit_out = Path(args.output) if args.output and len(inputs) == 1 else None
     for inp in inputs:
-        out = _resolve_output_path(inp, explicit_out)
+        out = _resolve_output_path(inp, output_root, explicit_out)
         try:
             enrich_file(
                 inp,
