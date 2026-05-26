@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Enrich dealership Excel files with website provider and phone from dealer sites.
+Enrich dealership Excel/CSV files with website provider, phone, email, chat widget,
+and dealer type (franchise vs private) from dealer sites and names.
 
 Every input row is written to the enriched output.
-Failed provider/phone lookups include a note in Website Enrichment Notes explaining why.
+Failed website lookups include a note in Website Enrichment Notes explaining why.
 
 Split work across terminals with -W (total workers) and -w (this worker, 0..N-1).
 Multiple input files are split by file; a single file is split by state column or by row.
@@ -23,8 +24,11 @@ import pandas as pd
 from openpyxl import Workbook
 from tqdm import tqdm
 
+from dealer_chat_widget import detect_chat_widgets
+from dealer_email import extract_primary_email
 from dealer_phone import extract_primary_phone
 from dealer_platforms import DEALER_PLATFORMS
+from dealer_type import classify_dealer_type
 from website_provider import (
     detect_from_html,
     fetch_dealer_html,
@@ -50,16 +54,39 @@ STATE_COLUMN_CANDIDATES = (
     "region",
 )
 
+NAME_COLUMN_CANDIDATES = (
+    "dealer name",
+    "dealername",
+    "dealership name",
+    "dealership",
+    "name",
+    "dealer",
+    "business name",
+    "company name",
+    "store name",
+)
+
 OUTPUT_PROVIDER_COL = "Website Provider"
 OUTPUT_PHONE_COL = "Website Phone"
+OUTPUT_EMAIL_COL = "Website Email"
+OUTPUT_CHAT_WIDGET_COL = "Chat Widget"
+OUTPUT_DEALER_TYPE_COL = "Dealer Type"
 OUTPUT_NOTES_COL = "Website Enrichment Notes"
 
-ENRICHMENT_COLS = (OUTPUT_PROVIDER_COL, OUTPUT_PHONE_COL, OUTPUT_NOTES_COL)
+ENRICHMENT_COLS = (
+    OUTPUT_PROVIDER_COL,
+    OUTPUT_PHONE_COL,
+    OUTPUT_EMAIL_COL,
+    OUTPUT_CHAT_WIDGET_COL,
+    OUTPUT_DEALER_TYPE_COL,
+    OUTPUT_NOTES_COL,
+)
 
 REASON_NO_WEBSITE = "No dealer website provided"
 REASON_SITE_NOT_LOADED = "Website could not be loaded"
 REASON_PROVIDER_NOT_FOUND = "Website provider not detected on site"
 REASON_PHONE_NOT_FOUND = "Phone number not found on website"
+REASON_EMAIL_NOT_FOUND = "Email address not found on website"
 
 SUPPORTED_INPUT_SUFFIXES = frozenset({".xlsx", ".xlsm", ".xls", ".csv"})
 DEFAULT_CSV_SEP = "|"
@@ -77,6 +104,24 @@ def _find_state_column(df: pd.DataFrame, override: str | None) -> str | None:
             return lower_map[key]
     for col in df.columns:
         if "state" in str(col).lower():
+            return col
+    return None
+
+
+def _find_name_column(df: pd.DataFrame, override: str | None) -> str | None:
+    if override:
+        if override not in df.columns:
+            raise ValueError(f"Column not found: {override!r}. Available: {list(df.columns)}")
+        return override
+    lower_map = {str(c).strip().lower(): c for c in df.columns}
+    for key in NAME_COLUMN_CANDIDATES:
+        if key in lower_map:
+            return lower_map[key]
+    for col in df.columns:
+        low = str(col).lower()
+        if "dealer" in low and "name" in low:
+            return col
+        if low in ("name", "dealership"):
             return col
     return None
 
@@ -107,8 +152,18 @@ def _serialize_cell(value: Any) -> str:
     return str(value)
 
 
+def _exclude_output_column(col: str) -> bool:
+    """Drop status / worker columns from enriched outputs (not re-emitted)."""
+    low = str(col).strip().lower()
+    if low in ("process id", "process_id", "pid", "worker", "worker id", "worker_id"):
+        return True
+    if "enrichment notes" in low:
+        return True
+    return False
+
+
 def _output_columns(df: pd.DataFrame) -> list[str]:
-    cols = list(df.columns)
+    cols = [c for c in df.columns if not _exclude_output_column(c)]
     for col in ENRICHMENT_COLS:
         if col not in cols:
             cols.append(col)
@@ -178,8 +233,9 @@ def _enrichment_notes(
     loaded: bool,
     provider: str,
     phone: str,
+    email: str,
 ) -> str:
-    """Human-readable reasons when provider and/or phone could not be enriched."""
+    """Human-readable reasons when website fields could not be enriched."""
     if not has_website:
         return REASON_NO_WEBSITE
     if not loaded:
@@ -190,6 +246,8 @@ def _enrichment_notes(
         reasons.append(REASON_PROVIDER_NOT_FOUND)
     if not phone:
         reasons.append(REASON_PHONE_NOT_FOUND)
+    if not email:
+        reasons.append(REASON_EMAIL_NOT_FOUND)
     return "; ".join(reasons)
 
 
@@ -197,19 +255,35 @@ def _make_enrichment(
     *,
     provider: str = "",
     phone: str = "",
+    email: str = "",
+    chat_widget: str = "",
+    dealer_type: str = "",
     has_website: bool = True,
     loaded: bool = True,
 ) -> dict[str, str]:
     return {
         OUTPUT_PROVIDER_COL: provider,
         OUTPUT_PHONE_COL: phone,
+        OUTPUT_EMAIL_COL: email,
+        OUTPUT_CHAT_WIDGET_COL: chat_widget,
+        OUTPUT_DEALER_TYPE_COL: dealer_type,
         OUTPUT_NOTES_COL: _enrichment_notes(
             has_website=has_website,
             loaded=loaded,
             provider=provider,
             phone=phone,
+            email=email,
         ),
     }
+
+
+def _dealer_type_for_row(df: pd.DataFrame, idx: int, name_col: str | None) -> str:
+    if not name_col:
+        return ""
+    val = df.at[idx, name_col]
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return ""
+    return classify_dealer_type(str(val))
 
 
 def _process_row(website: str, *, timeout: float) -> tuple[dict[str, str], bool]:
@@ -230,8 +304,20 @@ def _process_row(website: str, *, timeout: float) -> tuple[dict[str, str], bool]
         provider_name = provider_match.display_name
 
     phone = extract_primary_phone(html) or ""
+    email = extract_primary_email(html) or ""
+    chat_widget = detect_chat_widgets(html)
 
-    return _make_enrichment(provider=provider_name, phone=phone, loaded=True), True
+    return (
+        _make_enrichment(
+            provider=provider_name,
+            phone=phone,
+            email=email,
+            chat_widget=chat_widget,
+            loaded=True,
+        ),
+        True,
+    )
+
 
 
 def _build_output_row(df: pd.DataFrame, idx: int, enrichment: dict[str, Any]) -> dict[str, Any]:
@@ -284,6 +370,7 @@ def enrich_file(
     output_path: Path,
     *,
     website_col: str | None,
+    name_col: str | None,
     state_col: str | None,
     threads: int,
     timeout: float,
@@ -312,7 +399,12 @@ def enrich_file(
             return
 
     col = _find_website_column(df, website_col)
+    name_column = _find_name_column(df, name_col)
     log.info("Input %s: %s rows, website column %r", input_path.name, len(df), col)
+    if name_column:
+        log.info("Dealer type from name column %r", name_column)
+    else:
+        log.warning("No dealer name column found; Dealer Type will be empty (use --name-col)")
 
     if df.empty:
         log.warning("No rows in %s", input_path.name)
@@ -326,7 +418,11 @@ def enrich_file(
         if url:
             rows_with_url.append((idx, str(val)))
         else:
-            enrichments[idx] = _make_enrichment(has_website=False, loaded=False)
+            enrichments[idx] = _make_enrichment(
+                has_website=False,
+                loaded=False,
+                dealer_type=_dealer_type_for_row(df, idx, name_column),
+            )
             no_website += 1
 
     def task(item: tuple[int, str]) -> tuple[int, dict[str, str], bool]:
@@ -357,6 +453,9 @@ def enrich_file(
             row_enrichment = enrichments.get(
                 idx,
                 _make_enrichment(has_website=False, loaded=False),
+            )
+            row_enrichment[OUTPUT_DEALER_TYPE_COL] = _dealer_type_for_row(
+                df, idx, name_column
             )
             writer.append(_build_output_row(df, idx, row_enrichment))
     finally:
@@ -487,22 +586,19 @@ def _resolve_output_path(
     inp: Path,
     output_root: Path,
     explicit_output: Path | None,
-    *,
-    worker: int,
-    total_workers: int,
 ) -> Path:
-    """Place enriched files under ``<cwd>/enriched/``; suffix ``_wN`` when sharding."""
+    """Place output under ``<cwd>/enriched/`` using the same base name as the input."""
     if explicit_output is not None:
         return explicit_output
-    stem = f"{inp.stem}_enriched"
-    if total_workers > 1:
-        stem = f"{stem}_w{worker}"
-    return output_root / f"{stem}{inp.suffix}"
+    return output_root / inp.name
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Enrich dealer Excel/CSV with website provider and phone from dealer sites",
+        description=(
+            "Enrich dealer Excel/CSV with website provider, phone, email, "
+            "chat widget, and dealer type"
+        ),
     )
     parser.add_argument(
         "input",
@@ -513,12 +609,16 @@ def main() -> None:
         "--output",
         help=(
             f"Output path (single input only). "
-            f"Default: ./{ENRICHED_OUTPUT_DIR}/<input>_enriched<ext>"
+            f"Default: ./{ENRICHED_OUTPUT_DIR}/<input><ext> (same name as input)"
         ),
     )
     parser.add_argument(
         "--website-col",
         help="Column name for dealer website URLs (auto-detected if omitted)",
+    )
+    parser.add_argument(
+        "--name-col",
+        help="Column name for dealer / dealership name (auto-detected if omitted)",
     )
     parser.add_argument(
         "--state-col",
@@ -608,18 +708,13 @@ def main() -> None:
     output_root = _enriched_output_root()
     explicit_out = Path(args.output) if args.output and single_file else None
     for inp in inputs:
-        out = _resolve_output_path(
-            inp,
-            output_root,
-            explicit_out,
-            worker=args.worker,
-            total_workers=args.total_workers,
-        )
+        out = _resolve_output_path(inp, output_root, explicit_out)
         try:
             enrich_file(
                 inp,
                 out,
                 website_col=args.website_col,
+                name_col=args.name_col,
                 state_col=args.state_col,
                 threads=args.threads,
                 timeout=args.timeout,
