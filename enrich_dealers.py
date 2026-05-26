@@ -4,6 +4,9 @@ Enrich dealership Excel files with website provider and phone from dealer sites.
 
 Every input row is written to the enriched output.
 Failed provider/phone lookups include a note in Website Enrichment Notes explaining why.
+
+Split work across terminals with -W (total workers) and -w (this worker, 0..N-1).
+Multiple input files are split by file; a single file is split by state column or by row.
 """
 from __future__ import annotations
 
@@ -39,6 +42,14 @@ WEBSITE_COLUMN_CANDIDATES = (
     "site",
 )
 
+STATE_COLUMN_CANDIDATES = (
+    "state",
+    "st",
+    "dealer state",
+    "province",
+    "region",
+)
+
 OUTPUT_PROVIDER_COL = "Website Provider"
 OUTPUT_PHONE_COL = "Website Phone"
 OUTPUT_NOTES_COL = "Website Enrichment Notes"
@@ -53,6 +64,21 @@ REASON_PHONE_NOT_FOUND = "Phone number not found on website"
 SUPPORTED_INPUT_SUFFIXES = frozenset({".xlsx", ".xlsm", ".xls", ".csv"})
 DEFAULT_CSV_SEP = "|"
 ENRICHED_OUTPUT_DIR = "enriched"
+
+
+def _find_state_column(df: pd.DataFrame, override: str | None) -> str | None:
+    if override:
+        if override not in df.columns:
+            raise ValueError(f"Column not found: {override!r}. Available: {list(df.columns)}")
+        return override
+    lower_map = {str(c).strip().lower(): c for c in df.columns}
+    for key in STATE_COLUMN_CANDIDATES:
+        if key in lower_map:
+            return lower_map[key]
+    for col in df.columns:
+        if "state" in str(col).lower():
+            return col
+    return None
 
 
 def _find_website_column(df: pd.DataFrame, override: str | None) -> str:
@@ -214,16 +240,77 @@ def _build_output_row(df: pd.DataFrame, idx: int, enrichment: dict[str, Any]) ->
     return row
 
 
+def _shard_input_paths(paths: list[Path], worker: int, total_workers: int) -> list[Path]:
+    """Assign input files to worker ``worker`` of ``total_workers`` (sorted, round-robin)."""
+    if total_workers <= 1:
+        return paths
+    return [p for i, p in enumerate(paths) if i % total_workers == worker]
+
+
+def _apply_worker_shard(
+    df: pd.DataFrame,
+    worker: int,
+    total_workers: int,
+    *,
+    state_col: str | None,
+) -> tuple[pd.DataFrame, str]:
+    """Subset rows for this worker (by state list, else every Nth row)."""
+    if total_workers <= 1:
+        return df, "all rows"
+
+    if state_col is not None:
+        series = df[state_col].astype(str).str.strip()
+        states = sorted(s for s in series.dropna().unique() if s and s.lower() != "nan")
+        assigned = [s for i, s in enumerate(states) if i % total_workers == worker]
+        if not assigned:
+            return df.iloc[0:0], "no states assigned"
+        mask = series.isin(assigned)
+        label = ", ".join(assigned[:8]) + ("..." if len(assigned) > 8 else "")
+        return df.loc[mask], f"states: {label}"
+
+    subset = df.iloc[worker::total_workers]
+    return subset, f"row slice {worker} of {total_workers} (every {total_workers}th row)"
+
+
+def _validate_worker_args(worker: int, total_workers: int) -> None:
+    if total_workers < 1:
+        raise ValueError(f"-W must be >= 1, got {total_workers}")
+    if worker < 0 or worker >= total_workers:
+        raise ValueError(f"-w must be between 0 and {total_workers - 1}, got {worker}")
+
+
 def enrich_file(
     input_path: Path,
     output_path: Path,
     *,
     website_col: str | None,
-    workers: int,
+    state_col: str | None,
+    threads: int,
     timeout: float,
     csv_sep: str = DEFAULT_CSV_SEP,
+    worker: int = 0,
+    total_workers: int = 1,
+    shard_rows: bool = False,
 ) -> None:
     df = _read_table(input_path, csv_sep=csv_sep)
+    total_rows = len(df)
+
+    if shard_rows and total_workers > 1:
+        state_column = _find_state_column(df, state_col)
+        df, shard_desc = _apply_worker_shard(df, worker, total_workers, state_col=state_column)
+        log.info(
+            "Worker %s/%s on %s: %s (%s of %s rows)",
+            worker + 1,
+            total_workers,
+            input_path.name,
+            shard_desc,
+            len(df),
+            total_rows,
+        )
+        if df.empty:
+            log.warning("Worker %s/%s: no rows in shard; skipping file", worker + 1, total_workers)
+            return
+
     col = _find_website_column(df, website_col)
     log.info("Input %s: %s rows, website column %r", input_path.name, len(df), col)
 
@@ -249,7 +336,7 @@ def enrich_file(
 
     unloaded = 0
     if rows_with_url:
-        with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        with ThreadPoolExecutor(max_workers=max(1, threads)) as pool:
             futures = {pool.submit(task, item): item[0] for item in rows_with_url}
             for fut in tqdm(
                 as_completed(futures),
@@ -400,11 +487,17 @@ def _resolve_output_path(
     inp: Path,
     output_root: Path,
     explicit_output: Path | None,
+    *,
+    worker: int,
+    total_workers: int,
 ) -> Path:
-    """Place enriched files under ``<cwd>/enriched/``, not beside the input file."""
+    """Place enriched files under ``<cwd>/enriched/``; suffix ``_wN`` when sharding."""
     if explicit_output is not None:
         return explicit_output
-    return output_root / f"{inp.stem}_enriched{inp.suffix}"
+    stem = f"{inp.stem}_enriched"
+    if total_workers > 1:
+        stem = f"{stem}_w{worker}"
+    return output_root / f"{stem}{inp.suffix}"
 
 
 def main() -> None:
@@ -428,10 +521,31 @@ def main() -> None:
         help="Column name for dealer website URLs (auto-detected if omitted)",
     )
     parser.add_argument(
-        "--workers",
+        "--state-col",
+        help="Column name for US state (auto-detected if omitted; used to split -w/-W)",
+    )
+    parser.add_argument(
+        "-W",
+        "--total-workers",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Total parallel terminal runs sharing the job (default: 1)",
+    )
+    parser.add_argument(
+        "-w",
+        "--worker",
+        type=int,
+        default=0,
+        metavar="I",
+        help="This run's worker index, 0 to N-1 (default: 0). Use with -W",
+    )
+    parser.add_argument(
+        "-t",
+        "--threads",
         type=int,
         default=6,
-        help="Parallel fetch workers (default: 6)",
+        help="HTTP fetch threads inside this process (default: 6)",
     )
     parser.add_argument(
         "--timeout",
@@ -452,29 +566,67 @@ def main() -> None:
         format="%(levelname)s %(message)s",
     )
 
+    try:
+        _validate_worker_args(args.worker, args.total_workers)
+    except ValueError as exc:
+        log.error("%s", exc)
+        sys.exit(1)
+
     input_path = Path(args.input)
     try:
-        inputs = _collect_input_paths(input_path)
+        all_inputs = _collect_input_paths(input_path)
     except (FileNotFoundError, ValueError) as exc:
         log.error("%s", exc)
         sys.exit(1)
 
-    if len(inputs) > 1 and args.output:
+    if args.total_workers > 1:
+        log.info("Distributed worker %s of %s", args.worker + 1, args.total_workers)
+
+    single_file = len(all_inputs) == 1
+    if single_file:
+        inputs = all_inputs
+        shard_rows = args.total_workers > 1
+    else:
+        inputs = _shard_input_paths(all_inputs, args.worker, args.total_workers)
+        shard_rows = False
+        if args.total_workers > 1 and not inputs:
+            log.info(
+                "Worker %s/%s: no input files assigned (of %s files)",
+                args.worker + 1,
+                args.total_workers,
+                len(all_inputs),
+            )
+            return
+
+    if len(all_inputs) > 1 and args.output:
         log.error("--output is only valid with a single input file")
+        sys.exit(1)
+    if args.output and args.total_workers > 1:
+        log.error("--output cannot be used with -W > 1 (each worker writes its own file)")
         sys.exit(1)
 
     output_root = _enriched_output_root()
-    explicit_out = Path(args.output) if args.output and len(inputs) == 1 else None
+    explicit_out = Path(args.output) if args.output and single_file else None
     for inp in inputs:
-        out = _resolve_output_path(inp, output_root, explicit_out)
+        out = _resolve_output_path(
+            inp,
+            output_root,
+            explicit_out,
+            worker=args.worker,
+            total_workers=args.total_workers,
+        )
         try:
             enrich_file(
                 inp,
                 out,
                 website_col=args.website_col,
-                workers=args.workers,
+                state_col=args.state_col,
+                threads=args.threads,
                 timeout=args.timeout,
                 csv_sep=args.csv_sep,
+                worker=args.worker,
+                total_workers=args.total_workers,
+                shard_rows=shard_rows,
             )
         except Exception as exc:
             log.error("%s: %s", inp, exc)
