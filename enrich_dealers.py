@@ -96,9 +96,7 @@ ENRICHED_OUTPUT_DIR = "enriched_v2"
 
 def _find_state_column(df: pd.DataFrame, override: str | None) -> str | None:
     if override:
-        if override not in df.columns:
-            raise ValueError(f"Column not found: {override!r}. Available: {list(df.columns)}")
-        return override
+        return _resolve_column(df, override, required=True)
     lower_map = {str(c).strip().lower(): c for c in df.columns}
     for key in STATE_COLUMN_CANDIDATES:
         if key in lower_map:
@@ -109,11 +107,30 @@ def _find_state_column(df: pd.DataFrame, override: str | None) -> str | None:
     return None
 
 
+def _normalize_dataframe_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Strip BOM/whitespace from headers (common in Excel exports)."""
+    out = df.copy()
+    out.columns = [str(c).replace("\ufeff", "").strip() for c in out.columns]
+    return out
+
+
+def _resolve_column(df: pd.DataFrame, name: str, *, required: bool = True) -> str | None:
+    """Match a column by exact name, then case-insensitive stripped name."""
+    wanted = name.strip()
+    if wanted in df.columns:
+        return wanted
+    lower_map = {str(c).strip().lower(): c for c in df.columns}
+    found = lower_map.get(wanted.lower())
+    if found:
+        return found
+    if required:
+        raise ValueError(f"Column not found: {name!r}. Available: {list(df.columns)}")
+    return None
+
+
 def _find_name_column(df: pd.DataFrame, override: str | None) -> str | None:
     if override:
-        if override not in df.columns:
-            raise ValueError(f"Column not found: {override!r}. Available: {list(df.columns)}")
-        return override
+        return _resolve_column(df, override, required=True)
     lower_map = {str(c).strip().lower(): c for c in df.columns}
     for key in NAME_COLUMN_CANDIDATES:
         if key in lower_map:
@@ -129,9 +146,7 @@ def _find_name_column(df: pd.DataFrame, override: str | None) -> str | None:
 
 def _find_website_column(df: pd.DataFrame, override: str | None) -> str:
     if override:
-        if override not in df.columns:
-            raise ValueError(f"Column not found: {override!r}. Available: {list(df.columns)}")
-        return override
+        return _resolve_column(df, override, required=True)  # type: ignore[return-value]
 
     excluded = {
         OUTPUT_PROVIDER_COL.lower(),
@@ -657,20 +672,24 @@ def _sniff_csv_delimiter(path: Path, *, encoding: str) -> str:
 
 
 def _read_csv(path: Path, *, sep: str = DEFAULT_CSV_SEP) -> pd.DataFrame:
-    """Read pipe-delimited (or other) dealer CSV exports."""
+    """Read dealer CSV; pick delimiter that yields the most columns."""
     last_error: Exception | None = None
+    best_df: pd.DataFrame | None = None
+    best_cols = 0
+    best_meta: tuple[str, str, str] | None = None
 
     for encoding in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
+        sniffed = _sniff_csv_delimiter(path, encoding=encoding)
         attempts: list[tuple[str, str, str | None]] = [
-            (sep, "c", None),
-            (_sniff_csv_delimiter(path, encoding=encoding), "python", "warn"),
+            (sniffed, "python", "warn"),
             (",", "python", "warn"),
+            (sep, "c", None),
             (";", "python", "warn"),
             ("\t", "python", "warn"),
         ]
         seen: set[tuple[str, str, str | None]] = set()
-        for sep, engine, on_bad_lines in attempts:
-            key = (sep, engine, on_bad_lines)
+        for attempt_sep, engine, on_bad_lines in attempts:
+            key = (attempt_sep, engine, on_bad_lines)
             if key in seen:
                 continue
             seen.add(key)
@@ -679,23 +698,14 @@ def _read_csv(path: Path, *, sep: str = DEFAULT_CSV_SEP) -> pd.DataFrame:
                 "filepath_or_buffer": path,
                 "dtype": str,
                 "encoding": encoding,
-                "sep": sep,
+                "sep": attempt_sep,
                 "engine": engine,
             }
             if on_bad_lines is not None:
                 kwargs["on_bad_lines"] = on_bad_lines
 
             try:
-                df = pd.read_csv(**kwargs)
-                if sep != DEFAULT_CSV_SEP or engine != "c":
-                    log.info(
-                        "Parsed %s with encoding=%s, sep=%r, engine=%s",
-                        path.name,
-                        encoding,
-                        sep,
-                        engine,
-                    )
-                return df
+                df = _normalize_dataframe_columns(pd.read_csv(**kwargs))
             except UnicodeDecodeError as exc:
                 last_error = exc
                 break
@@ -705,16 +715,52 @@ def _read_csv(path: Path, *, sep: str = DEFAULT_CSV_SEP) -> pd.DataFrame:
                     "CSV parse failed for %s (encoding=%s, sep=%r, engine=%s): %s",
                     path.name,
                     encoding,
-                    sep,
+                    attempt_sep,
                     engine,
                     exc,
                 )
                 continue
 
+            ncols = len(df.columns)
+            if ncols > best_cols:
+                best_df = df
+                best_cols = ncols
+                best_meta = (encoding, attempt_sep, engine)
+
+            # Dealer exports usually have many columns; stop early on a good parse.
+            if ncols >= 8:
+                log.info(
+                    "Parsed %s with encoding=%s, sep=%r, engine=%s (%s columns)",
+                    path.name,
+                    encoding,
+                    attempt_sep,
+                    engine,
+                    ncols,
+                )
+                return df
+
+    if best_df is not None and best_meta is not None:
+        encoding, attempt_sep, engine = best_meta
+        log.info(
+            "Parsed %s with encoding=%s, sep=%r, engine=%s (%s columns)",
+            path.name,
+            encoding,
+            attempt_sep,
+            engine,
+            best_cols,
+        )
+        if best_cols == 1:
+            log.warning(
+                "Only 1 column detected in %s — file may be wrong delimiter. "
+                "Try: --csv-sep ,",
+                path.name,
+            )
+        return best_df
+
     msg = (
         f"Could not parse CSV: {path}. "
         "Common causes: wrong delimiter, extra unquoted separators in fields, or mixed encodings. "
-        f"Dealer files are expected to use {DEFAULT_CSV_SEP!r} by default; try --csv-sep if needed."
+        f"Try --csv-sep , or --csv-sep {DEFAULT_CSV_SEP!r}."
     )
     if last_error:
         msg += f" Last error: {last_error}"
@@ -724,7 +770,7 @@ def _read_csv(path: Path, *, sep: str = DEFAULT_CSV_SEP) -> pd.DataFrame:
 def _read_table(path: Path, *, csv_sep: str = DEFAULT_CSV_SEP) -> pd.DataFrame:
     suffix = path.suffix.lower()
     if suffix in (".xlsx", ".xlsm", ".xls"):
-        return pd.read_excel(path, dtype=str)
+        return _normalize_dataframe_columns(pd.read_excel(path, dtype=str))
     if suffix == ".csv":
         return _read_csv(path, sep=csv_sep)
     raise ValueError(f"Unsupported input format: {path}")
