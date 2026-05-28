@@ -8,51 +8,13 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 
+from dealer_fetch import fetch_dealer_html, normalize_dealer_url
 from dealer_platforms import DEALER_PLATFORMS
 from provider_rules import PROVIDERS, ProviderRule
 
 log = logging.getLogger("website_provider")
-
-CHROME_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-)
-
-DEFAULT_HEADERS = {
-    "User-Agent": CHROME_UA,
-    "Accept": (
-        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,"
-        "image/webp,image/apng,*/*;q=0.8"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate",
-    "DNT": "1",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-    "sec-ch-ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-    "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-platform": '"Windows"',
-}
-
-# DealerCenter sites often serve "/" or "/inventory"; CarsForSale often uses "/cars-for-sale".
-FALLBACK_PATHS = (
-    "/inventory",
-    "",
-    "/",
-    "/home",
-    "/cars-for-sale",
-    "/vehicles",
-    "/used-cars",
-    "/search",
-)
-
-_CLOUDFLARE_MARKERS = ("just a moment", "cf_chl_opt", "challenges.cloudflare.com")
 
 MIN_HTML_BYTES = 2_500
 
@@ -79,23 +41,6 @@ TARGET_PROVIDER_NAMES: tuple[str, ...] = DEALER_PLATFORMS
 _COMPILED = _compile_rules(PROVIDERS)
 
 
-def _is_cloudflare_challenge(html: str) -> bool:
-    low = html.lower()
-    return any(m in low for m in _CLOUDFLARE_MARKERS)
-
-
-def normalize_dealer_url(url: str) -> str | None:
-    url = (url or "").strip()
-    if not url or url.lower() in ("not specified", "n/a", "none", "-"):
-        return None
-    if not url.startswith(("http://", "https://")):
-        url = "https://" + url
-    parsed = urlparse(url)
-    if not parsed.netloc:
-        return None
-    return f"{parsed.scheme}://{parsed.netloc}{parsed.path or '/'}".rstrip("/") + "/"
-
-
 def _external_hosts(html: str) -> set[str]:
     hosts: set[str] = set()
     for raw in re.findall(
@@ -109,66 +54,6 @@ def _external_hosts(html: str) -> set[str]:
         if host:
             hosts.add(host)
     return hosts
-
-
-def _fetch_one(url: str, timeout: float) -> tuple[int, str, str]:
-    try:
-        from curl_cffi import requests as http
-
-        r = http.get(
-            url,
-            impersonate="chrome131",
-            timeout=timeout,
-            allow_redirects=True,
-            headers=DEFAULT_HEADERS,
-        )
-        return r.status_code, r.url, r.text or ""
-    except ImportError:
-        import requests as http
-
-        r = http.get(
-            url,
-            headers=DEFAULT_HEADERS,
-            timeout=timeout,
-            allow_redirects=True,
-        )
-        return r.status_code, r.url, r.text or ""
-
-
-def fetch_dealer_html(
-    base_url: str,
-    *,
-    timeout: float = 30.0,
-    paths: tuple[str, ...] = FALLBACK_PATHS,
-) -> tuple[str, str] | None:
-    """
-    Return (final_url, html) for the first path that returns a usable document.
-    """
-    parsed = urlparse(base_url)
-    origin = f"{parsed.scheme}://{parsed.netloc}"
-
-    cloudflare_blocked = False
-
-    for path in paths:
-        url = origin if path in ("", "/") else urljoin(origin + "/", path.lstrip("/"))
-        try:
-            status, final_url, html = _fetch_one(url, timeout)
-        except Exception as exc:
-            log.warning("fetch failed %s: %s", url, exc)
-            continue
-        if status == 200 and len(html) >= MIN_HTML_BYTES:
-            log.debug("fetched %s (%s bytes)", final_url, len(html))
-            return final_url, html
-        if _is_cloudflare_challenge(html):
-            cloudflare_blocked = True
-        log.debug("skip %s status=%s bytes=%s", url, status, len(html))
-
-    if cloudflare_blocked:
-        log.warning(
-            "site behind Cloudflare challenge (try from a residential IP or browser); %s",
-            base_url,
-        )
-    return None
 
 
 def score_provider(html: str, hosts: set[str]) -> list[ProviderMatch]:

@@ -29,11 +29,8 @@ from dealer_email import extract_primary_email
 from dealer_phone import extract_primary_phone
 from dealer_platforms import DEALER_PLATFORMS
 from dealer_type import classify_dealer_type
-from website_provider import (
-    detect_from_html,
-    fetch_dealer_html,
-    normalize_dealer_url,
-)
+from dealer_fetch import FetchMode, fetch_dealer_html, normalize_dealer_url
+from website_provider import detect_from_html
 
 log = logging.getLogger("enrich_dealers")
 
@@ -286,13 +283,24 @@ def _dealer_type_for_row(df: pd.DataFrame, idx: int, name_col: str | None) -> st
     return classify_dealer_type(str(val))
 
 
-def _process_row(website: str, *, timeout: float) -> tuple[dict[str, str], bool]:
+def _process_row(
+    website: str,
+    *,
+    timeout: float,
+    fetch_mode: str,
+    headed: bool,
+) -> tuple[dict[str, str], bool]:
     """Fetch dealer site; return (enrichment fields, site_loaded)."""
     base = normalize_dealer_url(str(website) if website is not None else "")
     if not base:
         return _make_enrichment(has_website=False, loaded=False), False
 
-    fetched = fetch_dealer_html(base, timeout=timeout)
+    fetched = fetch_dealer_html(
+        base,
+        timeout=timeout,
+        mode=fetch_mode,
+        headed=headed,
+    )
     if not fetched:
         log.debug("site not loaded: %s", base)
         return _make_enrichment(loaded=False), False
@@ -378,7 +386,15 @@ def enrich_file(
     worker: int = 0,
     total_workers: int = 1,
     shard_rows: bool = False,
+    fetch_mode: str = FetchMode.AUTO.value,
+    headed: bool = False,
 ) -> None:
+    if fetch_mode in (FetchMode.BROWSER.value, FetchMode.AUTO.value) and threads > 2:
+        log.warning(
+            "Browser fetch with %s threads can be unstable; use -t 1 or -t 2 for browser/auto",
+            threads,
+        )
+
     df = _read_table(input_path, csv_sep=csv_sep)
     total_rows = len(df)
 
@@ -427,7 +443,12 @@ def enrich_file(
 
     def task(item: tuple[int, str]) -> tuple[int, dict[str, str], bool]:
         idx, url = item
-        enrichment, loaded = _process_row(url, timeout=timeout)
+        enrichment, loaded = _process_row(
+            url,
+            timeout=timeout,
+            fetch_mode=fetch_mode,
+            headed=headed,
+        )
         return idx, enrichment, loaded
 
     unloaded = 0
@@ -650,8 +671,22 @@ def main() -> None:
     parser.add_argument(
         "--timeout",
         type=float,
-        default=30.0,
-        help="HTTP timeout per request in seconds (default: 30)",
+        default=45.0,
+        help="Fetch timeout per site in seconds (default: 45)",
+    )
+    parser.add_argument(
+        "--fetch-mode",
+        choices=("auto", "http", "browser"),
+        default="auto",
+        help=(
+            "How to load dealer sites: auto=HTTP then browser if blocked (default), "
+            "http=fast curl_cffi only, browser=Playwright Chromium"
+        ),
+    )
+    parser.add_argument(
+        "--browser-headed",
+        action="store_true",
+        help="Show browser window when using Playwright (helps with some CAPTCHAs)",
     )
     parser.add_argument(
         "--csv-sep",
@@ -722,6 +757,8 @@ def main() -> None:
                 worker=args.worker,
                 total_workers=args.total_workers,
                 shard_rows=shard_rows,
+                fetch_mode=args.fetch_mode,
+                headed=args.browser_headed,
             )
         except Exception as exc:
             log.error("%s: %s", inp, exc)
