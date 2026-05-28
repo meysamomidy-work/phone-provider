@@ -38,6 +38,10 @@ WEBSITE_COLUMN_CANDIDATES = (
     "website",
     "dealer website",
     "dealerwebsite",
+    "website url",
+    "website_url",
+    "dealer url",
+    "dealer_url",
     "url",
     "web site",
     "site",
@@ -128,12 +132,30 @@ def _find_website_column(df: pd.DataFrame, override: str | None) -> str:
         if override not in df.columns:
             raise ValueError(f"Column not found: {override!r}. Available: {list(df.columns)}")
         return override
-    lower_map = {str(c).strip().lower(): c for c in df.columns}
+
+    excluded = {
+        OUTPUT_PROVIDER_COL.lower(),
+        OUTPUT_PHONE_COL.lower(),
+        OUTPUT_EMAIL_COL.lower(),
+        OUTPUT_CHAT_WIDGET_COL.lower(),
+        OUTPUT_DEALER_TYPE_COL.lower(),
+        OUTPUT_NOTES_COL.lower(),
+    }
+    lower_map = {
+        str(c).strip().lower(): c
+        for c in df.columns
+        if str(c).strip().lower() not in excluded
+    }
+
     for key in WEBSITE_COLUMN_CANDIDATES:
         if key in lower_map:
             return lower_map[key]
+
     for col in df.columns:
-        if "website" in str(col).lower():
+        low = str(col).strip().lower()
+        if low in excluded:
+            continue
+        if "website" in low or low.endswith(" url") or low == "url":
             return col
     raise ValueError(
         "Could not detect website column. Use --website-col. "
