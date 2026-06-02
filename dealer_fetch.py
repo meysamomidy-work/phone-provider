@@ -38,14 +38,14 @@ _NAV_HEADERS = {
 }
 
 FALLBACK_PATHS = (
-    "/inventory",
-    "",
-    "/",
+    # "/inventory",
+    # "",
+    # "/",
     "/home",
-    "/cars-for-sale",
-    "/vehicles",
-    "/used-cars",
-    "/search",
+    # "/cars-for-sale",
+    # "/vehicles",
+    # "/used-cars",
+    # "/search",
 )
 
 _CHALLENGE_MARKERS = (
