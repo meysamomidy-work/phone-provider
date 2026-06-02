@@ -178,18 +178,6 @@ def _find_website_column(df: pd.DataFrame, override: str | None) -> str:
     )
 
 
-def _find_column_case_insensitive(df: pd.DataFrame, target: str) -> str | None:
-    lower_map = {str(c).strip().lower(): c for c in df.columns}
-    return lower_map.get(target.strip().lower())
-
-
-def _col_has_non_empty_values(df: pd.DataFrame, col: str | None) -> bool:
-    if not col or col not in df.columns:
-        return False
-    series = df[col].fillna("").astype(str).str.strip()
-    return bool((series != "").any())
-
-
 def _serialize_cell(value: Any) -> str:
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return ""
@@ -332,74 +320,6 @@ def _dealer_type_for_row(df: pd.DataFrame, idx: int, name_col: str | None) -> st
     return classify_dealer_type(str(val))
 
 
-def _existing_enrichment_for_row(
-    df: pd.DataFrame,
-    idx: int,
-    *,
-    notes_col: str | None,
-    dealer_type: str,
-) -> dict[str, str]:
-    def get_if_exists(col: str) -> str:
-        if col not in df.columns:
-            return ""
-        val = df.at[idx, col]
-        if val is None or (isinstance(val, float) and pd.isna(val)):
-            return ""
-        return str(val)
-
-    notes = get_if_exists(notes_col) if notes_col else ""
-    return {
-        OUTPUT_PROVIDER_COL: get_if_exists(OUTPUT_PROVIDER_COL),
-        OUTPUT_PHONE_COL: get_if_exists(OUTPUT_PHONE_COL),
-        OUTPUT_EMAIL_COL: get_if_exists(OUTPUT_EMAIL_COL),
-        OUTPUT_CHAT_WIDGET_COL: get_if_exists(OUTPUT_CHAT_WIDGET_COL),
-        OUTPUT_DEALER_TYPE_COL: dealer_type or get_if_exists(OUTPUT_DEALER_TYPE_COL),
-        OUTPUT_NOTES_COL: notes,
-    }
-
-
-def _should_retry_site_not_loaded(
-    df: pd.DataFrame,
-    idx: int,
-    *,
-    notes_col: str | None,
-) -> bool:
-    if not notes_col:
-        return False
-    raw = df.at[idx, notes_col]
-    if raw is None or (isinstance(raw, float) and pd.isna(raw)):
-        return False
-    note = str(raw).strip().lower()
-    return note == REASON_SITE_NOT_LOADED.lower()
-
-
-def _row_has_any_site_enrichment(df: pd.DataFrame, idx: int) -> bool:
-    cols = (
-        OUTPUT_PROVIDER_COL,
-        OUTPUT_PHONE_COL,
-        OUTPUT_EMAIL_COL,
-        OUTPUT_CHAT_WIDGET_COL,
-    )
-    for col in cols:
-        if col not in df.columns:
-            continue
-        raw = df.at[idx, col]
-        if raw is None or (isinstance(raw, float) and pd.isna(raw)):
-            continue
-        if str(raw).strip():
-            return True
-    return False
-
-
-def _row_has_note_text(df: pd.DataFrame, idx: int, notes_col: str | None) -> bool:
-    if not notes_col or notes_col not in df.columns:
-        return False
-    raw = df.at[idx, notes_col]
-    if raw is None or (isinstance(raw, float) and pd.isna(raw)):
-        return False
-    return bool(str(raw).strip())
-
-
 def _process_row(
     website: str,
     *,
@@ -533,33 +453,11 @@ def enrich_file(
 
     col = _find_website_column(df, website_col)
     name_column = _find_name_column(df, name_col)
-    notes_column = _find_column_case_insensitive(df, OUTPUT_NOTES_COL)
-    has_any_enrichment_cols = any(c in df.columns for c in ENRICHMENT_COLS)
-    has_existing_enrichment_values = any(
-        _col_has_non_empty_values(df, c)
-        for c in (
-            _find_column_case_insensitive(df, OUTPUT_PROVIDER_COL),
-            _find_column_case_insensitive(df, OUTPUT_PHONE_COL),
-            _find_column_case_insensitive(df, OUTPUT_EMAIL_COL),
-            _find_column_case_insensitive(df, OUTPUT_CHAT_WIDGET_COL),
-            notes_column,
-        )
-    )
-    retry_site_not_loaded_only = notes_column is not None and has_existing_enrichment_values
     log.info("Input %s: %s rows, website column %r", input_path.name, len(df), col)
     if name_column:
         log.info("Dealer type from name column %r", name_column)
     else:
         log.warning("No dealer name column found; Dealer Type will be empty (use --name-col)")
-    if retry_site_not_loaded_only:
-        log.info(
-            "Detected existing enrichment notes; retrying only rows with %r via browser fetch",
-            REASON_SITE_NOT_LOADED,
-        )
-    elif notes_column is not None and not has_existing_enrichment_values:
-        log.info(
-            "Enrichment columns exist but are empty; treating file as fresh input and enriching all rows"
-        )
 
     if df.empty:
         log.warning("No rows in %s", input_path.name)
@@ -567,45 +465,17 @@ def enrich_file(
     enrichments: dict[int, dict[str, str]] = {}
     rows_with_url: list[tuple[int, str, str]] = []
     no_website = 0
-    skipped_existing = 0
 
     for idx, val in df[col].items():
         dealer_type = _dealer_type_for_row(df, idx, name_column)
         url = normalize_dealer_url(str(val) if pd.notna(val) else "")
         if not url:
-            if has_any_enrichment_cols:
-                enrichments[idx] = _existing_enrichment_for_row(
-                    df,
-                    idx,
-                    notes_col=notes_column,
-                    dealer_type=dealer_type,
-                )
-                skipped_existing += 1
-            else:
-                enrichments[idx] = _make_enrichment(
-                    has_website=False,
-                    loaded=False,
-                    dealer_type=dealer_type,
-                )
-                no_website += 1
-            continue
-
-        if retry_site_not_loaded_only:
-            if _should_retry_site_not_loaded(df, idx, notes_col=notes_column):
-                rows_with_url.append((idx, str(val), FetchMode.BROWSER.value))
-            elif not _row_has_any_site_enrichment(df, idx) and not _row_has_note_text(
-                df, idx, notes_column
-            ):
-                # Partial/empty prefilled enrichment columns: still process this row.
-                rows_with_url.append((idx, str(val), fetch_mode))
-            else:
-                enrichments[idx] = _existing_enrichment_for_row(
-                    df,
-                    idx,
-                    notes_col=notes_column,
-                    dealer_type=dealer_type,
-                )
-                skipped_existing += 1
+            enrichments[idx] = _make_enrichment(
+                has_website=False,
+                loaded=False,
+                dealer_type=dealer_type,
+            )
+            no_website += 1
             continue
 
         rows_with_url.append((idx, str(val), fetch_mode))
@@ -652,12 +522,11 @@ def enrich_file(
         writer.close()
 
     log.info(
-        "Wrote %s (%s rows: %s no website, %s retried site-not-loaded, %s kept existing, %s still not loaded)",
+        "Wrote %s (%s rows: %s no website, %s fetched, %s site not loaded)",
         output_path,
         writer.count,
         no_website,
         len(rows_with_url),
-        skipped_existing,
         unloaded,
     )
 
