@@ -39,9 +39,9 @@ _NAV_HEADERS = {
 
 FALLBACK_PATHS = (
     # "/inventory",
-    # "",
+    "",
     # "/",
-    "/home",
+    # "/home",
     # "/cars-for-sale",
     # "/vehicles",
     # "/used-cars",
