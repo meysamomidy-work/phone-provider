@@ -90,8 +90,8 @@ REASON_PHONE_NOT_FOUND = "Phone number not found on website"
 REASON_EMAIL_NOT_FOUND = "Email address not found on website"
 
 SUPPORTED_INPUT_SUFFIXES = frozenset({".xlsx", ".xlsm", ".xls", ".csv"})
-DEFAULT_CSV_SEP = "|"
-ENRICHED_OUTPUT_DIR = "enriched_v2"
+DEFAULT_CSV_SEP = ","
+ENRICHED_OUTPUT_DIR = "enriched_v3"
 
 
 def _find_state_column(df: pd.DataFrame, override: str | None) -> str | None:

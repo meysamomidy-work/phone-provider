@@ -12,6 +12,7 @@ CHAT_WIDGET_COMPETITORS: tuple[str, ...] = (
     "podium",
     "carnow",
     "dealerai",
+    "drivee_ai",
     "matador",
     "tecobi",
     "spyne",
@@ -33,6 +34,7 @@ _DISPLAY_NAMES: dict[str, str] = {
     "podium": "Podium",
     "carnow": "CarNow",
     "dealerai": "DealerAI",
+    "drivee_ai": "Drivee.ai",
     "matador": "Matador",
     "tecobi": "Tecobi",
     "spyne": "Spyne",
@@ -87,6 +89,22 @@ _RULES: tuple[_ChatWidgetRule, ...] = (
         ("dealerai.com", "dealer ai chat"),
         (r"dealerai\.com", r"cdn\.dealerai\.com", r"app\.dealerai\.com"),
         (r"^.*\.dealerai\.com$",),
+    ),
+    _ChatWidgetRule(
+        "drivee_ai",
+        (
+            "drivee.ai",
+            "salesagent-widget.web.app",
+            "salesagent-widget-iframe",
+            "salesagentwidget",
+        ),
+        (
+            r"drivee\.ai",
+            r"salesagent-widget\.web\.app",
+            r"salesagent-widget-iframe",
+            r"salesagentwidget",
+        ),
+        (r"^salesagent-widget\.web\.app$", r"^.*\.drivee\.ai$"),
     ),
     _ChatWidgetRule(
         "matador",
