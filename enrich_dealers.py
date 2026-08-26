@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Enrich dealership Excel/CSV files with website provider, phone, email, chat widget,
-and dealer type (franchise vs private) from dealer sites and names.
+360° vehicle viewers, customer AI, and dealer type from dealer sites and names.
 
 Every input row is written to the enriched output.
 Failed website lookups include a note in Website Enrichment Notes explaining why.
@@ -25,6 +25,8 @@ from openpyxl import Workbook
 from tqdm import tqdm
 
 from dealer_chat_widget import detect_chat_widgets
+from dealer_360_imaging import detect_360_viewers
+from dealer_customer_ai import detect_customer_ai
 from dealer_email import extract_primary_email
 from dealer_phone import extract_primary_phone
 from dealer_platforms import DEALER_PLATFORMS
@@ -35,7 +37,10 @@ from website_provider import detect_from_html
 log = logging.getLogger("enrich_dealers")
 
 WEBSITE_COLUMN_CANDIDATES = (
+    "resolved website",
     "website",
+    "google map website",
+    "discovered website",
     "dealer website",
     "dealerwebsite",
     "website url",
@@ -71,6 +76,8 @@ OUTPUT_PROVIDER_COL = "Website Provider"
 OUTPUT_PHONE_COL = "Website Phone"
 OUTPUT_EMAIL_COL = "Website Email"
 OUTPUT_CHAT_WIDGET_COL = "Chat Widget"
+OUTPUT_360_VIEWER_COL = "360° Vehicle Viewer"
+OUTPUT_CUSTOMER_AI_COL = "Customer AI"
 OUTPUT_DEALER_TYPE_COL = "Dealer Type"
 OUTPUT_NOTES_COL = "Website Enrichment Notes"
 
@@ -79,6 +86,8 @@ ENRICHMENT_COLS = (
     OUTPUT_PHONE_COL,
     OUTPUT_EMAIL_COL,
     OUTPUT_CHAT_WIDGET_COL,
+    OUTPUT_360_VIEWER_COL,
+    OUTPUT_CUSTOMER_AI_COL,
     OUTPUT_DEALER_TYPE_COL,
     OUTPUT_NOTES_COL,
 )
@@ -153,6 +162,8 @@ def _find_website_column(df: pd.DataFrame, override: str | None) -> str:
         OUTPUT_PHONE_COL.lower(),
         OUTPUT_EMAIL_COL.lower(),
         OUTPUT_CHAT_WIDGET_COL.lower(),
+        OUTPUT_360_VIEWER_COL.lower(),
+        OUTPUT_CUSTOMER_AI_COL.lower(),
         OUTPUT_DEALER_TYPE_COL.lower(),
         OUTPUT_NOTES_COL.lower(),
     }
@@ -291,6 +302,8 @@ def _make_enrichment(
     phone: str = "",
     email: str = "",
     chat_widget: str = "",
+    vehicle_viewer: str = "",
+    customer_ai: str = "",
     dealer_type: str = "",
     has_website: bool = True,
     loaded: bool = True,
@@ -300,6 +313,8 @@ def _make_enrichment(
         OUTPUT_PHONE_COL: phone,
         OUTPUT_EMAIL_COL: email,
         OUTPUT_CHAT_WIDGET_COL: chat_widget,
+        OUTPUT_360_VIEWER_COL: vehicle_viewer,
+        OUTPUT_CUSTOMER_AI_COL: customer_ai,
         OUTPUT_DEALER_TYPE_COL: dealer_type,
         OUTPUT_NOTES_COL: _enrichment_notes(
             has_website=has_website,
@@ -351,6 +366,8 @@ def _process_row(
     phone = extract_primary_phone(html) or ""
     email = extract_primary_email(html) or ""
     chat_widget = detect_chat_widgets(html)
+    vehicle_viewer = detect_360_viewers(html)
+    customer_ai = detect_customer_ai(html)
 
     return (
         _make_enrichment(
@@ -358,6 +375,8 @@ def _process_row(
             phone=phone,
             email=email,
             chat_widget=chat_widget,
+            vehicle_viewer=vehicle_viewer,
+            customer_ai=customer_ai,
             loaded=True,
         ),
         True,
@@ -689,7 +708,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Enrich dealer Excel/CSV with website provider, phone, email, "
-            "chat widget, and dealer type"
+            "chat widget, 360° vehicle viewer, customer AI, and dealer type"
         ),
     )
     parser.add_argument(
