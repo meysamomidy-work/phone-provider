@@ -92,6 +92,18 @@ ENRICHMENT_COLS = (
     OUTPUT_NOTES_COL,
 )
 
+# These fields require the dealer page to be loaded.  Dealer Type is handled
+# from the dealership name and Website Enrichment Notes can be derived from the
+# values already present in the row.
+WEBSITE_FETCH_COLS = (
+    OUTPUT_PROVIDER_COL,
+    OUTPUT_PHONE_COL,
+    OUTPUT_EMAIL_COL,
+    OUTPUT_CHAT_WIDGET_COL,
+    OUTPUT_360_VIEWER_COL,
+    OUTPUT_CUSTOMER_AI_COL,
+)
+
 REASON_NO_WEBSITE = "No dealer website provided"
 REASON_SITE_NOT_LOADED = "Website could not be loaded"
 REASON_PROVIDER_NOT_FOUND = "Website provider not detected on site"
@@ -100,7 +112,7 @@ REASON_EMAIL_NOT_FOUND = "Email address not found on website"
 
 SUPPORTED_INPUT_SUFFIXES = frozenset({".xlsx", ".xlsm", ".xls", ".csv"})
 DEFAULT_CSV_SEP = ","
-ENRICHED_OUTPUT_DIR = "enriched_v3"
+ENRICHED_OUTPUT_DIR = "enriched_v5"
 
 
 def _find_state_column(df: pd.DataFrame, override: str | None) -> str | None:
@@ -201,8 +213,6 @@ def _exclude_output_column(col: str) -> bool:
     """Drop status / worker columns from enriched outputs (not re-emitted)."""
     low = str(col).strip().lower()
     if low in ("process id", "process_id", "pid", "worker", "worker id", "worker_id"):
-        return True
-    if "enrichment notes" in low:
         return True
     return False
 
@@ -326,6 +336,49 @@ def _make_enrichment(
     }
 
 
+def _has_enrichment_value(value: object) -> bool:
+    """True for a real existing cell value that must not be overwritten."""
+    return bool(_serialize_cell(value).strip())
+
+
+def _existing_enrichment(df: pd.DataFrame, idx: int) -> dict[str, str]:
+    """Read only the enrichment cells already supplied on this input row."""
+    return {
+        col: _serialize_cell(df.at[idx, col]) if col in df.columns else ""
+        for col in ENRICHMENT_COLS
+    }
+
+
+def _needs_website_fetch(existing: dict[str, str]) -> bool:
+    """Only fetch when at least one page-derived field is still empty."""
+    return any(not _has_enrichment_value(existing[field]) for field in WEBSITE_FETCH_COLS)
+
+
+def _merge_enrichment(
+    existing: dict[str, str],
+    generated: dict[str, str],
+    *,
+    has_website: bool,
+    loaded: bool,
+) -> dict[str, str]:
+    """Keep populated input values; fill only empty cells from this run."""
+    merged = {
+        col: existing[col] if _has_enrichment_value(existing.get(col, "")) else generated.get(col, "")
+        for col in ENRICHMENT_COLS
+    }
+    # Notes follow the same non-overwrite rule. When they were absent, generate
+    # them from the final (possibly partly pre-existing) provider/phone/email.
+    if not _has_enrichment_value(existing.get(OUTPUT_NOTES_COL, "")):
+        merged[OUTPUT_NOTES_COL] = _enrichment_notes(
+            has_website=has_website,
+            loaded=loaded,
+            provider=merged[OUTPUT_PROVIDER_COL],
+            phone=merged[OUTPUT_PHONE_COL],
+            email=merged[OUTPUT_EMAIL_COL],
+        )
+    return merged
+
+
 def _dealer_type_for_row(df: pd.DataFrame, idx: int, name_col: str | None) -> str:
     if not name_col:
         return ""
@@ -338,6 +391,7 @@ def _dealer_type_for_row(df: pd.DataFrame, idx: int, name_col: str | None) -> st
 def _process_row(
     website: str,
     *,
+    existing: dict[str, str],
     timeout: float,
     fetch_mode: str,
     headed: bool,
@@ -345,7 +399,15 @@ def _process_row(
     """Fetch dealer site; return (enrichment fields, site_loaded)."""
     base = normalize_dealer_url(str(website) if website is not None else "")
     if not base:
-        return _make_enrichment(has_website=False, loaded=False), False
+        return (
+            _merge_enrichment(
+                existing,
+                _make_enrichment(has_website=False, loaded=False),
+                has_website=False,
+                loaded=False,
+            ),
+            False,
+        )
 
     fetched = fetch_dealer_html(
         base,
@@ -355,28 +417,62 @@ def _process_row(
     )
     if not fetched:
         log.debug("site not loaded: %s", base)
-        return _make_enrichment(loaded=False), False
+        return (
+            _merge_enrichment(
+                existing,
+                _make_enrichment(loaded=False),
+                has_website=True,
+                loaded=False,
+            ),
+            False,
+        )
 
     final_url, html = fetched
-    provider_match = detect_from_html(html, source_url=final_url)
     provider_name = ""
-    if provider_match and provider_match.display_name in DEALER_PLATFORMS:
-        provider_name = provider_match.display_name
+    if not _has_enrichment_value(existing[OUTPUT_PROVIDER_COL]):
+        provider_match = detect_from_html(html, source_url=final_url)
+        if provider_match and provider_match.display_name in DEALER_PLATFORMS:
+            provider_name = provider_match.display_name
 
-    phone = extract_primary_phone(html) or ""
-    email = extract_primary_email(html) or ""
-    chat_widget = detect_chat_widgets(html)
-    vehicle_viewer = detect_360_viewers(html)
-    customer_ai = detect_customer_ai(html)
+    phone = (
+        extract_primary_phone(html) or ""
+        if not _has_enrichment_value(existing[OUTPUT_PHONE_COL])
+        else ""
+    )
+    email = (
+        extract_primary_email(html) or ""
+        if not _has_enrichment_value(existing[OUTPUT_EMAIL_COL])
+        else ""
+    )
+    chat_widget = (
+        detect_chat_widgets(html)
+        if not _has_enrichment_value(existing[OUTPUT_CHAT_WIDGET_COL])
+        else ""
+    )
+    vehicle_viewer = (
+        detect_360_viewers(html)
+        if not _has_enrichment_value(existing[OUTPUT_360_VIEWER_COL])
+        else ""
+    )
+    customer_ai = (
+        detect_customer_ai(html)
+        if not _has_enrichment_value(existing[OUTPUT_CUSTOMER_AI_COL])
+        else ""
+    )
 
     return (
-        _make_enrichment(
-            provider=provider_name,
-            phone=phone,
-            email=email,
-            chat_widget=chat_widget,
-            vehicle_viewer=vehicle_viewer,
-            customer_ai=customer_ai,
+        _merge_enrichment(
+            existing,
+            _make_enrichment(
+                provider=provider_name,
+                phone=phone,
+                email=email,
+                chat_widget=chat_widget,
+                vehicle_viewer=vehicle_viewer,
+                customer_ai=customer_ai,
+                loaded=True,
+            ),
+            has_website=True,
             loaded=True,
         ),
         True,
@@ -482,27 +578,44 @@ def enrich_file(
         log.warning("No rows in %s", input_path.name)
 
     enrichments: dict[int, dict[str, str]] = {}
-    rows_with_url: list[tuple[int, str, str]] = []
+    rows_with_url: list[tuple[int, str, str, dict[str, str]]] = []
     no_website = 0
+    already_complete = 0
 
     for idx, val in df[col].items():
-        dealer_type = _dealer_type_for_row(df, idx, name_column)
+        existing = _existing_enrichment(df, idx)
+        if not _has_enrichment_value(existing[OUTPUT_DEALER_TYPE_COL]):
+            existing[OUTPUT_DEALER_TYPE_COL] = _dealer_type_for_row(df, idx, name_column)
         url = normalize_dealer_url(str(val) if pd.notna(val) else "")
         if not url:
-            enrichments[idx] = _make_enrichment(
+            enrichments[idx] = _merge_enrichment(
+                existing,
+                _make_enrichment(has_website=False, loaded=False),
                 has_website=False,
                 loaded=False,
-                dealer_type=dealer_type,
             )
             no_website += 1
             continue
 
-        rows_with_url.append((idx, str(val), fetch_mode))
+        if not _needs_website_fetch(existing):
+            # No network request or detector call is needed for a fully
+            # enriched website row.
+            enrichments[idx] = _merge_enrichment(
+                existing,
+                _make_enrichment(),
+                has_website=True,
+                loaded=True,
+            )
+            already_complete += 1
+            continue
 
-    def task(item: tuple[int, str, str]) -> tuple[int, dict[str, str], bool]:
-        idx, url, row_fetch_mode = item
+        rows_with_url.append((idx, str(val), fetch_mode, existing))
+
+    def task(item: tuple[int, str, str, dict[str, str]]) -> tuple[int, dict[str, str], bool]:
+        idx, url, row_fetch_mode, existing = item
         enrichment, loaded = _process_row(
             url,
+            existing=existing,
             timeout=timeout,
             fetch_mode=row_fetch_mode,
             headed=headed,
@@ -531,20 +644,23 @@ def enrich_file(
         for idx in df.index:
             row_enrichment = enrichments.get(
                 idx,
-                _make_enrichment(has_website=False, loaded=False),
-            )
-            row_enrichment[OUTPUT_DEALER_TYPE_COL] = _dealer_type_for_row(
-                df, idx, name_column
+                _merge_enrichment(
+                    _existing_enrichment(df, idx),
+                    _make_enrichment(has_website=False, loaded=False),
+                    has_website=False,
+                    loaded=False,
+                ),
             )
             writer.append(_build_output_row(df, idx, row_enrichment))
     finally:
         writer.close()
 
     log.info(
-        "Wrote %s (%s rows: %s no website, %s fetched, %s site not loaded)",
+        "Wrote %s (%s rows: %s no website, %s already complete, %s fetched, %s site not loaded)",
         output_path,
         writer.count,
         no_website,
+        already_complete,
         len(rows_with_url),
         unloaded,
     )
