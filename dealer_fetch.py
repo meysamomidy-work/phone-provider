@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import random
+import re
 import time
 from enum import Enum
 from urllib.parse import urljoin, urlparse
@@ -289,6 +290,100 @@ def fetch_browser(
             browser.close()
 
 
+def extract_resource_urls(html: str, base_url: str) -> set[str]:
+    """Return absolute script/frame/style/image URLs referenced by an HTML page."""
+    urls: set[str] = set()
+    for raw in re.findall(
+        r'<(?:script|link|img|iframe|source)[^>]+(?:src|href)=["\']([^"\']+)',
+        html or "",
+        re.I,
+    ):
+        raw = raw.strip()
+        if raw and not raw.startswith(("data:", "javascript:", "mailto:")):
+            urls.add(urljoin(base_url, raw))
+    return urls
+
+
+def fetch_browser_with_resources(
+    url: str,
+    *,
+    timeout: float = 30.0,
+    headed: bool = False,
+    wait_after_load_ms: int = 4_000,
+) -> tuple[str, str, str, set[str]] | None:
+    """Load a page in Chromium and capture useful browser-loaded resource URLs.
+
+    The response listener sees integrations injected after the initial HTML,
+    which is important for chat and vehicle-imaging widgets.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        log.warning("playwright not installed (%s). Run: pip install playwright && playwright install chromium", exc)
+        return None
+
+    timeout_ms = int(timeout * 1000)
+    label = "playwright/headed+resources" if headed else "playwright/headless+resources"
+    resource_urls: set[str] = set()
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=not headed,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-dev-shm-usage",
+                "--no-sandbox",
+            ],
+        )
+        context = browser.new_context(
+            user_agent=CHROME_UA,
+            viewport={"width": 1920, "height": 1080},
+            locale="en-US",
+            timezone_id="America/New_York",
+            extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+        )
+        context.add_init_script(
+            """
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            window.chrome = { runtime: {} };
+            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+            """
+        )
+        page = context.new_page()
+
+        def capture(response: object) -> None:
+            try:
+                request = response.request  # type: ignore[attr-defined]
+                if request.resource_type in {"document", "script", "stylesheet", "iframe", "xhr", "fetch"}:
+                    resource_urls.add(response.url)  # type: ignore[attr-defined]
+            except Exception:
+                # A resource event must never make the dealer page fetch fail.
+                pass
+
+        page.on("response", capture)
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            try:
+                page.wait_for_load_state("networkidle", timeout=min(timeout_ms, 15_000))
+            except Exception:
+                pass
+            page.wait_for_timeout(wait_after_load_ms)
+            html = page.content()
+            final_url = page.url
+            if is_usable_html(html):
+                resource_urls.update(extract_resource_urls(html, final_url))
+                log.debug("browser resources ok %s (%s resources)", final_url, len(resource_urls))
+                return final_url, html, label, resource_urls
+            return None
+        except Exception as exc:
+            log.warning("browser resource fetch failed %s: %s", url, exc)
+            return None
+        finally:
+            context.close()
+            browser.close()
+
+
 def fetch_browser_paths(
     base_url: str,
     *,
@@ -341,6 +436,42 @@ def fetch_dealer_html(
         final_url, html, _ = browser_result
         return final_url, html
     return None
+
+
+def fetch_dealer_html_with_resources(
+    base_url: str,
+    *,
+    timeout: float = 30.0,
+    paths: tuple[str, ...] = FALLBACK_PATHS,
+    mode: str | FetchMode = FetchMode.AUTO,
+    headed: bool = False,
+    force_browser: bool = False,
+) -> tuple[str, str, set[str]] | None:
+    """Like :func:`fetch_dealer_html`, plus static/dynamic integration URLs.
+
+    ``force_browser`` is used by the optional deep detector.  It deliberately
+    does not change the normal fast HTTP-first enrichment path.
+    """
+    fetch_mode = FetchMode(mode) if isinstance(mode, str) else mode
+    if force_browser and fetch_mode != FetchMode.HTTP:
+        for url in _origin_paths(base_url, paths):
+            browser_result = fetch_browser_with_resources(url, timeout=timeout, headed=headed)
+            if browser_result:
+                final_url, html, _, resources = browser_result
+                return final_url, html, resources
+            _jitter(0.5)
+
+    fetched = fetch_dealer_html(
+        base_url,
+        timeout=timeout,
+        paths=paths,
+        mode=fetch_mode,
+        headed=headed,
+    )
+    if not fetched:
+        return None
+    final_url, html = fetched
+    return final_url, html, extract_resource_urls(html, final_url)
 
 
 def fetch_dealer_html_with_meta(

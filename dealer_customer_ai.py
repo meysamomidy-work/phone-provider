@@ -18,6 +18,11 @@ _VENDOR_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Numa", ("numa.com", "numa ai")),
     ("Rybo", ("rybo.ai",)),
     ("Sandra AI", ("sandra.ai", "sandra ai")),
+    ("Conversica", ("conversica.com", "conversica ai")),
+    ("AutoConverse", ("autoconverse.com", "autoconverse chat")),
+    ("CarBuddy", ("carbuddyai.com", "carbuddy webchat")),
+    ("ChatBeacon", ("chatbeacon.ai", "chatbeacon")),
+    ("Dealerbot", ("dealerbot.co.uk", "dealerbot")),
 )
 
 # Require an AI claim together with an actual conversational-control signal.
@@ -25,7 +30,8 @@ _VENDOR_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
 # false positive.
 _EXPLICIT_AI = re.compile(
     r"(?:ai[- ]?(?:powered )?(?:chat|assistant|agent|concierge|conversation)|"
-    r"(?:chat|assistant|agent|concierge)[^<]{0,80}?(?:powered by )?ai)",
+    r"(?:chat|assistant|agent|concierge)[^<]{0,80}?(?:powered by )?ai|"
+    r"(?:virtual salesperson|digital assistant)[^<]{0,80}?(?:ai|artificial intelligence))",
     re.I,
 )
 _CONVERSATION_CONTROL = re.compile(

@@ -40,6 +40,7 @@ _RULES: tuple[_ViewerRule, ...] = (
 _GENERIC_VIEWER_PATTERNS = (
     re.compile(r"<(?:iframe|model-viewer)\b[^>]*(?:360(?:viewer|view|spin)|spin(?:car|view|viewer)|vehicle[-_ ]?turntable)", re.I),
     re.compile(r"(?:data-|class=|id=)[\"'][^\"']*(?:360[-_ ]?(?:viewer|view|spin)|spin[-_ ]?(?:car|viewer)|turntable)[^\"']*[\"']", re.I),
+    re.compile(r"<(?:canvas|script)\b[^>]*(?:360[-_ ]?(?:viewer|spin)|spin[-_ ]?(?:viewer|car)|turntable)", re.I),
 )
 
 

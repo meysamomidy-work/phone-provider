@@ -13,12 +13,15 @@ from __future__ import annotations
 
 import argparse
 import csv
+import html as html_lib
 import logging
+import re
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
+from urllib.parse import urldefrag, urljoin, urlparse
 
 import pandas as pd
 from openpyxl import Workbook
@@ -31,7 +34,12 @@ from dealer_email import extract_primary_email
 from dealer_phone import extract_primary_phone
 from dealer_platforms import DEALER_PLATFORMS
 from dealer_type import classify_dealer_type
-from dealer_fetch import FetchMode, fetch_dealer_html, normalize_dealer_url
+from dealer_fetch import (
+    FetchMode,
+    fetch_dealer_html,
+    fetch_dealer_html_with_resources,
+    normalize_dealer_url,
+)
 from website_provider import detect_from_html
 
 log = logging.getLogger("enrich_dealers")
@@ -113,6 +121,17 @@ REASON_EMAIL_NOT_FOUND = "Email address not found on website"
 SUPPORTED_INPUT_SUFFIXES = frozenset({".xlsx", ".xlsm", ".xls", ".csv"})
 DEFAULT_CSV_SEP = ","
 ENRICHED_OUTPUT_DIR = "enriched_v5"
+
+_VDP_PATH_HINTS = re.compile(
+    r"(?:/vehicle|/inventory|/vdp(?:/|$)|/details?(?:/|$)|/cars-for-sale|/used-|/new-)",
+    re.I,
+)
+_NON_HTML_PATH = re.compile(r"\.(?:pdf|jpg|jpeg|png|gif|webp|svg|zip)(?:$|[?#])", re.I)
+_GENERIC_RESULTS = {
+    "Generic chat widget",
+    "Generic 360° viewer",
+    "AI customer assistant (vendor unknown)",
+}
 
 
 def _find_state_column(df: pd.DataFrame, override: str | None) -> str | None:
@@ -388,6 +407,60 @@ def _dealer_type_for_row(df: pd.DataFrame, idx: int, name_col: str | None) -> st
     return classify_dealer_type(str(val))
 
 
+def _site_host(url: str) -> str:
+    """Comparable host that treats www.example.com as example.com."""
+    return urlparse(url).netloc.lower().split(":", 1)[0].removeprefix("www.")
+
+
+def _detection_html(html: str, resource_urls: set[str]) -> str:
+    """Expose runtime resource domains to the existing HTML-based detectors."""
+    if not resource_urls:
+        return html
+    resource_tags = "\n".join(
+        f'<script src="{html_lib.escape(url, quote=True)}"></script>'
+        for url in sorted(resource_urls)
+    )
+    return f"{html}\n<!-- browser-loaded resources -->\n{resource_tags}"
+
+
+def _vehicle_detail_urls(html: str, base_url: str, *, limit: int) -> list[str]:
+    """Return a small, same-site sample of likely vehicle-detail page URLs."""
+    if limit <= 0:
+        return []
+    base_host = _site_host(base_url)
+    found: list[str] = []
+    seen: set[str] = set()
+    for raw in re.findall(r'<a\b[^>]*\bhref=["\']([^"\']+)', html or "", re.I):
+        absolute, _ = urldefrag(urljoin(base_url, html_lib.unescape(raw).strip()))
+        parsed = urlparse(absolute)
+        if parsed.scheme not in {"http", "https"} or _site_host(absolute) != base_host:
+            continue
+        if not _VDP_PATH_HINTS.search(parsed.path) or _NON_HTML_PATH.search(absolute):
+            continue
+        # Finance/share/filter links can contain inventory words without being a VDP.
+        if any(word in parsed.path.lower() for word in ("/contact", "/finance", "/service", "/parts")):
+            continue
+        canonical = parsed._replace(query="", fragment="").geturl()
+        if canonical not in seen:
+            seen.add(canonical)
+            found.append(canonical)
+            if len(found) >= limit:
+                break
+    return found
+
+
+def _combine_detection_values(values: list[str]) -> str:
+    """Merge page-level detections, preferring a named provider over generic."""
+    entries: list[str] = []
+    for value in values:
+        for part in (value or "").split(","):
+            part = part.strip()
+            if part and part not in entries:
+                entries.append(part)
+    named = [entry for entry in entries if entry not in _GENERIC_RESULTS]
+    return ", ".join(named or entries)
+
+
 def _process_row(
     website: str,
     *,
@@ -395,6 +468,8 @@ def _process_row(
     timeout: float,
     fetch_mode: str,
     headed: bool,
+    deep_detection: bool = False,
+    vdp_sample_size: int = 3,
 ) -> tuple[dict[str, str], bool]:
     """Fetch dealer site; return (enrichment fields, site_loaded)."""
     base = normalize_dealer_url(str(website) if website is not None else "")
@@ -409,12 +484,31 @@ def _process_row(
             False,
         )
 
-    fetched = fetch_dealer_html(
-        base,
-        timeout=timeout,
-        mode=fetch_mode,
-        headed=headed,
+    needs_deep_detectors = any(
+        not _has_enrichment_value(existing[col])
+        for col in (OUTPUT_CHAT_WIDGET_COL, OUTPUT_360_VIEWER_COL, OUTPUT_CUSTOMER_AI_COL)
     )
+    if deep_detection and needs_deep_detectors:
+        fetched_with_resources = fetch_dealer_html_with_resources(
+            base,
+            timeout=timeout,
+            mode=fetch_mode,
+            headed=headed,
+            force_browser=True,
+        )
+        fetched = (
+            (fetched_with_resources[0], fetched_with_resources[1])
+            if fetched_with_resources else None
+        )
+        homepage_resources = fetched_with_resources[2] if fetched_with_resources else set()
+    else:
+        fetched = fetch_dealer_html(
+            base,
+            timeout=timeout,
+            mode=fetch_mode,
+            headed=headed,
+        )
+        homepage_resources: set[str] = set()
     if not fetched:
         log.debug("site not loaded: %s", base)
         return (
@@ -428,6 +522,23 @@ def _process_row(
         )
 
     final_url, html = fetched
+    detection_pages: list[str] = [_detection_html(html, homepage_resources)]
+
+    if deep_detection and needs_deep_detectors:
+        vdp_urls = _vehicle_detail_urls(html, final_url, limit=vdp_sample_size)
+        for vdp_url in vdp_urls:
+            vdp = fetch_dealer_html_with_resources(
+                vdp_url,
+                timeout=timeout,
+                mode=fetch_mode,
+                headed=headed,
+            )
+            if vdp:
+                vdp_final_url, vdp_html, vdp_resources = vdp
+                detection_pages.append(_detection_html(vdp_html, vdp_resources))
+                log.debug("deep scan sampled %s", vdp_final_url)
+        log.debug("deep scan %s: homepage + %s vehicle pages", final_url, len(detection_pages) - 1)
+
     provider_name = ""
     if not _has_enrichment_value(existing[OUTPUT_PROVIDER_COL]):
         provider_match = detect_from_html(html, source_url=final_url)
@@ -445,17 +556,17 @@ def _process_row(
         else ""
     )
     chat_widget = (
-        detect_chat_widgets(html)
+        _combine_detection_values([detect_chat_widgets(page) for page in detection_pages])
         if not _has_enrichment_value(existing[OUTPUT_CHAT_WIDGET_COL])
         else ""
     )
     vehicle_viewer = (
-        detect_360_viewers(html)
+        _combine_detection_values([detect_360_viewers(page) for page in detection_pages])
         if not _has_enrichment_value(existing[OUTPUT_360_VIEWER_COL])
         else ""
     )
     customer_ai = (
-        detect_customer_ai(html)
+        _combine_detection_values([detect_customer_ai(page) for page in detection_pages])
         if not _has_enrichment_value(existing[OUTPUT_CUSTOMER_AI_COL])
         else ""
     )
@@ -540,8 +651,15 @@ def enrich_file(
     shard_rows: bool = False,
     fetch_mode: str = FetchMode.AUTO.value,
     headed: bool = False,
+    deep_detection: bool = False,
+    vdp_sample_size: int = 3,
 ) -> None:
-    if fetch_mode in (FetchMode.BROWSER.value, FetchMode.AUTO.value) and threads > 2:
+    if deep_detection and threads > 2:
+        log.warning(
+            "Deep detection launches a browser per dealer; use -t 1 or -t 2 (currently %s)",
+            threads,
+        )
+    elif fetch_mode in (FetchMode.BROWSER.value, FetchMode.AUTO.value) and threads > 2:
         log.warning(
             "Browser fetch with %s threads can be unstable; use -t 1 or -t 2 for browser/auto",
             threads,
@@ -569,6 +687,8 @@ def enrich_file(
     col = _find_website_column(df, website_col)
     name_column = _find_name_column(df, name_col)
     log.info("Input %s: %s rows, website column %r", input_path.name, len(df), col)
+    if deep_detection:
+        log.info("Deep detection enabled: browser resources + up to %s vehicle-detail pages/site", vdp_sample_size)
     if name_column:
         log.info("Dealer type from name column %r", name_column)
     else:
@@ -619,6 +739,8 @@ def enrich_file(
             timeout=timeout,
             fetch_mode=row_fetch_mode,
             headed=headed,
+            deep_detection=deep_detection,
+            vdp_sample_size=vdp_sample_size,
         )
         return idx, enrichment, loaded
 
@@ -895,6 +1017,21 @@ def main() -> None:
         help="Show browser window when using Playwright (helps with some CAPTCHAs)",
     )
     parser.add_argument(
+        "--deep-detection",
+        action="store_true",
+        help=(
+            "Broaden chat/AI/360 detection: capture browser-loaded integrations "
+            "and sample vehicle-detail pages (slower; use -t 1 or -t 2)"
+        ),
+    )
+    parser.add_argument(
+        "--vdp-sample-size",
+        type=int,
+        default=3,
+        metavar="N",
+        help="Vehicle-detail pages to sample with --deep-detection (default: 3)",
+    )
+    parser.add_argument(
         "--csv-sep",
         default=DEFAULT_CSV_SEP,
         help=f"Column separator for .csv inputs (default: {DEFAULT_CSV_SEP!r})",
@@ -909,6 +1046,8 @@ def main() -> None:
 
     try:
         _validate_worker_args(args.worker, args.total_workers)
+        if args.vdp_sample_size < 0:
+            raise ValueError("--vdp-sample-size must be >= 0")
     except ValueError as exc:
         log.error("%s", exc)
         sys.exit(1)
@@ -965,6 +1104,8 @@ def main() -> None:
                 shard_rows=shard_rows,
                 fetch_mode=args.fetch_mode,
                 headed=args.browser_headed,
+                deep_detection=args.deep_detection,
+                vdp_sample_size=args.vdp_sample_size,
             )
         except Exception as exc:
             log.error("%s: %s", inp, exc)

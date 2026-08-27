@@ -26,6 +26,18 @@ CHAT_WIDGET_COMPETITORS: tuple[str, ...] = (
     "selly_automotive",
     "sandra_ai",
     "autofi",
+    "activengage",
+    "contact_at_once",
+    "carchat24",
+    "livechat",
+    "intercom",
+    "zendesk",
+    "drift",
+    "conversica",
+    "autoconverse",
+    "carbuddy",
+    "chatbeacon",
+    "dealerbot",
 )
 
 _DISPLAY_NAMES: dict[str, str] = {
@@ -48,6 +60,18 @@ _DISPLAY_NAMES: dict[str, str] = {
     "selly_automotive": "Selly Automotive",
     "sandra_ai": "Sandra AI",
     "autofi": "AutoFi",
+    "activengage": "ActivEngage",
+    "contact_at_once": "Contact At Once",
+    "carchat24": "CarChat24",
+    "livechat": "LiveChat",
+    "intercom": "Intercom",
+    "zendesk": "Zendesk",
+    "drift": "Drift",
+    "conversica": "Conversica",
+    "autoconverse": "AutoConverse",
+    "carbuddy": "CarBuddy",
+    "chatbeacon": "ChatBeacon",
+    "dealerbot": "Dealerbot",
 }
 
 
@@ -184,12 +208,92 @@ _RULES: tuple[_ChatWidgetRule, ...] = (
         (r"autofi\.com", r"autofi\.io", r"cdn\.autofi\.com"),
         (r"^.*\.autofi\.com$", r"^.*\.autofi\.io$"),
     ),
+    _ChatWidgetRule(
+        "activengage",
+        ("activengage.com", "activengage chat"),
+        (r"activengage\.com",),
+        (r"^.*\.activengage\.com$",),
+    ),
+    _ChatWidgetRule(
+        "contact_at_once",
+        ("contactatonce.com", "contact at once"),
+        (r"contactatonce\.com",),
+        (r"^.*\.contactatonce\.com$",),
+    ),
+    _ChatWidgetRule(
+        "carchat24",
+        ("carchat24.com", "car chat 24"),
+        (r"carchat24\.com",),
+        (r"^.*\.carchat24\.com$",),
+    ),
+    _ChatWidgetRule(
+        "livechat",
+        ("livechatinc.com", "livechat-widget"),
+        (r"livechatinc\.com", r"livechat-widget"),
+        (r"^.*\.livechatinc\.com$",),
+    ),
+    _ChatWidgetRule(
+        "intercom",
+        ("intercom.io", "intercomcdn.com", "intercom-messenger"),
+        (r"intercom(?:cdn)?\.com", r"intercom\.io"),
+        (r"^.*\.intercom\.io$", r"^.*\.intercomcdn\.com$"),
+    ),
+    _ChatWidgetRule(
+        "zendesk",
+        ("static.zdassets.com", "zendesk web widget", "zopim"),
+        (r"zdassets\.com", r"zopim\.com"),
+        (r"^.*\.zdassets\.com$", r"^.*\.zopim\.com$"),
+    ),
+    _ChatWidgetRule(
+        "drift",
+        ("drift.com", "driftt.com", "drift-widget"),
+        (r"driftt?\.com",),
+        (r"^.*\.driftt?\.com$",),
+    ),
+    _ChatWidgetRule(
+        "conversica",
+        ("conversica.com", "conversica ai"),
+        (r"conversica\.com",),
+        (r"^.*\.conversica\.com$",),
+    ),
+    _ChatWidgetRule(
+        "autoconverse",
+        ("autoconverse.com", "autoconverse chat"),
+        (r"autoconverse\.com",),
+        (r"^.*\.autoconverse\.com$",),
+    ),
+    _ChatWidgetRule(
+        "carbuddy",
+        ("carbuddyai.com", "carbuddy webchat"),
+        (r"carbuddyai\.com",),
+        (r"^.*\.carbuddyai\.com$",),
+    ),
+    _ChatWidgetRule(
+        "chatbeacon",
+        ("chatbeacon.ai", "chatbeacon"),
+        (r"chatbeacon\.ai",),
+        (r"^.*\.chatbeacon\.ai$",),
+    ),
+    _ChatWidgetRule(
+        "dealerbot",
+        ("dealerbot.co.uk", "dealerbot"),
+        (r"dealerbot\.co\.uk",),
+        (r"^.*\.dealerbot\.co\.uk$",),
+    ),
 )
 
 _COMPILED: list[tuple[_ChatWidgetRule, list[re.Pattern[str]]]] = []
 for rule in _RULES:
     patterns = [re.compile(p, re.I) for p in rule.html_regexes + rule.host_regexes]
     _COMPILED.append((rule, patterns))
+
+
+# A generic result is intentionally limited to implementation signatures, not
+# a dealer merely writing "chat with us" on a contact page.
+_GENERIC_WIDGET_PATTERNS = (
+    re.compile(r"<(?:iframe|script)\b[^>]+(?:src=)?[^>]*(?:chatbot|chat[-_ ]?widget|livechat|messenger)", re.I),
+    re.compile(r"(?:class|id|data-[\w-]+)=[\"'][^\"']*(?:chat[-_ ]?(?:launcher|widget|button)|livechat|chatbot)[^\"']*[\"']", re.I),
+)
 
 
 def _external_hosts(html: str) -> set[str]:
@@ -241,4 +345,8 @@ def detect_chat_widgets(html: str) -> str:
 
     order = {name: i for i, name in enumerate(_DISPLAY_NAMES.values())}
     found.sort(key=lambda n: order.get(n, 999))
-    return ", ".join(found)
+    if found:
+        return ", ".join(found)
+    if any(pattern.search(html) for pattern in _GENERIC_WIDGET_PATTERNS):
+        return "Generic chat widget"
+    return ""

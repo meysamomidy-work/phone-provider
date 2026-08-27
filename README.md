@@ -7,6 +7,22 @@ email, chat, dealer-type, 360° viewer, and customer-AI fields.
 python enrich_dealers.py ..\google-maps\enriched_new -t 6 --fetch-mode auto
 ```
 
+For a broader pass over integrations that are injected by JavaScript or only
+exist on a vehicle-detail page, use deep detection. It opens a browser for the
+home page, captures loaded script/frame/API URLs, and samples up to three
+likely vehicle pages. It is materially slower, so keep threads at one or two.
+
+```powershell
+python enrich_dealers.py discovered -t 2 --fetch-mode auto `
+  --deep-detection --vdp-sample-size 3
+```
+
+This is an evidence-based detector, not a complete vendor catalogue: named
+providers are reported when their actual embed/delivery signature is found;
+unknown but clearly implemented widgets are reported as a conservative
+generic result. Existing populated enrichment cells are never overwritten,
+including when deep detection is enabled.
+
 The two new fields are deliberately separate:
 
 - `360° Vehicle Viewer` identifies embedded spin/turntable integrations (for
