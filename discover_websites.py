@@ -133,6 +133,8 @@ class DiscoveryResult:
 
 
 class GooglePlacesFinder:
+    provider_name = "Google Places API"
+
     def __init__(self, api_key: str, timeout: float) -> None:
         self.api_key = api_key
         self.timeout = timeout
@@ -246,6 +248,7 @@ def _verify_search_results(
 class GoogleCustomSearchFinder:
     """Google web-search fallback for existing Custom Search JSON API users."""
 
+    provider_name = "Google Custom Search"
     endpoint = "https://www.googleapis.com/customsearch/v1"
 
     def __init__(self, api_key: str, search_engine_id: str, timeout: float) -> None:
@@ -284,6 +287,8 @@ class GoogleCustomSearchFinder:
 class ExaWebFinder:
     """Exa web-search fallback for dealers without a verified Places result."""
 
+    provider_name = "Exa Search"
+
     def __init__(self, api_key: str, timeout: float) -> None:
         self.timeout = timeout
         self.client = Exa(api_key=api_key) if Exa is not None else None
@@ -320,6 +325,8 @@ class ExaWebFinder:
 class TavilyWebFinder:
     """Tavily web-search fallback for dealers without a verified Places result."""
 
+    provider_name = "Tavily Search"
+
     def __init__(self, api_key: str, timeout: float) -> None:
         self.timeout = timeout
         self.client = TavilyClient(api_key=api_key) if TavilyClient is not None else None
@@ -349,6 +356,7 @@ class TavilyWebFinder:
 class BraveWebFinder:
     """Independent web-search fallback for dealers that have no Maps website."""
 
+    provider_name = "Brave Search"
     endpoint = "https://api.search.brave.com/res/v1/web/search"
 
     def __init__(self, api_key: str, timeout: float) -> None:
@@ -445,13 +453,18 @@ def discover_file(path: Path, output: Path, finders: list[Any], args: argparse.N
         name = str(df.at[idx, name_col])
         address = str(df.at[idx, address_col])
         phone = str(df.at[idx, phone_col]) if phone_col else ""
-        results: list[DiscoveryResult] = []
+        failed_notes: list[str] = []
         for finder in finders:
             result = finder.find(name, address, phone, args.min_confidence)
-            results.append(result)
             if result.website:
                 return idx, result
-        return idx, results[-1] if results else DiscoveryResult(note="No discovery provider configured")
+            provider_name = getattr(finder, "provider_name", finder.__class__.__name__)
+            note = result.note or "no verified result"
+            failed_notes.append(f"{provider_name}: {note}")
+            log.debug("%s did not resolve %r: %s", provider_name, name, note)
+        return idx, DiscoveryResult(
+            note=" | ".join(failed_notes) or "No discovery provider configured"
+        )
 
     found = 0
     found_by_source: Counter[str] = Counter()
@@ -499,6 +512,7 @@ def main() -> None:
     parser.add_argument("--min-confidence", type=int, default=75, help="Minimum score before a website is accepted (default: 75)")
     parser.add_argument("-t", "--threads", type=int, default=4, help="Concurrent API requests (default: 4)")
     parser.add_argument("--timeout", type=float, default=20.0)
+    parser.add_argument("-v", "--verbose", action="store_true", help="Log every provider fallback attempt")
     args = parser.parse_args()
     if bool(args.google_custom_search_api_key) != bool(args.google_custom_search_cx):
         parser.error("Google Custom Search requires both --google-custom-search-api-key and --google-custom-search-cx")
@@ -507,7 +521,10 @@ def main() -> None:
     if not 0 <= args.min_confidence <= 100:
         parser.error("--min-confidence must be between 0 and 100")
 
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(levelname)s %(message)s",
+    )
     source = Path(args.input)
     if source.is_file():
         files = [source]
@@ -537,6 +554,12 @@ def main() -> None:
         )
     if args.brave_search_api_key:
         finders.append(BraveWebFinder(args.brave_search_api_key, args.timeout))
+    log.info(
+        "Discovery providers (in order): %s",
+        " -> ".join(getattr(finder, "provider_name", finder.__class__.__name__) for finder in finders),
+    )
+    if args.exa_api_key and Exa is None:
+        log.warning("Exa key is configured but exa-py is not installed; run: pip install -r requirements.txt")
     for file, output in zip(files, output_paths):
         discover_file(file, output, finders, args)
 
