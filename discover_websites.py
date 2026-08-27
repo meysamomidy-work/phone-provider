@@ -293,10 +293,12 @@ class ExaWebFinder:
             return DiscoveryResult(note="Exa Search unavailable: install exa-py")
         try:
             response = self.client.search(
-                f'"{name}" "{address}"',
+                f'"{name}"',
+                # f'"{name}" "{address}"',
                 num_results=3,
                 type="auto",
                 contents={"highlights": True},
+                system_prompt="we need to find the main domain of dealerships"
             )
             raw_results = getattr(response, "results", [])
             results = [
