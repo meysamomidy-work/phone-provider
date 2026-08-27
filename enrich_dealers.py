@@ -120,7 +120,7 @@ REASON_EMAIL_NOT_FOUND = "Email address not found on website"
 
 SUPPORTED_INPUT_SUFFIXES = frozenset({".xlsx", ".xlsm", ".xls", ".csv"})
 DEFAULT_CSV_SEP = ","
-ENRICHED_OUTPUT_DIR = "enriched_v5"
+ENRICHED_OUTPUT_DIR = "enriched_v6"
 
 _VDP_PATH_HINTS = re.compile(
     r"(?:/vehicle|/inventory|/vdp(?:/|$)|/details?(?:/|$)|/cars-for-sale|/used-|/new-)",
