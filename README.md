@@ -18,9 +18,10 @@ The two new fields are deliberately separate:
 ## Filling missing dealer websites
 
 After the Google Maps stage, run `discover_websites.py` before enrichment. It
-checks Google Places first and can use the independent Brave Search API for the
-rows where Google has no official site. Both sources are checked against dealer
-name plus ZIP/phone evidence, and neither overwrites the original `Website` or
+checks Google Places first, then Exa Search, Tavily Search, Google Custom
+Search (when configured), and finally the independent Brave Search API. Search
+fallbacks inspect only the first three results and require a matching dealer
+page before accepting a site. No source overwrites the original `Website` or
 `Google Map Website` columns. It produces `Resolved Website`, which
 `enrich_dealers.py` now chooses first.
 
@@ -28,15 +29,21 @@ name plus ZIP/phone evidence, and neither overwrites the original `Website` or
 python discover_websites.py ..\google-maps\enriched_new `
   -o discovered `
   --google-places-api-key YOUR_GOOGLE_PLACES_KEY `
+  --exa-api-key YOUR_EXA_KEY `
+  --tavily-api-key YOUR_TAVILY_KEY `
+  --google-custom-search-api-key YOUR_GOOGLE_CUSTOM_SEARCH_KEY `
+  --google-custom-search-cx YOUR_PROGRAMMABLE_SEARCH_ENGINE_ID `
   --brave-search-api-key YOUR_BRAVE_SEARCH_KEY
 
 python enrich_dealers.py discovered -t 6 --fetch-mode auto
 ```
 
-Enable the Places API (New) for the Google Cloud project used by the key. The
-Brave key is optional but recommended because it is an independent web index;
-it is only used when Places returns no verified candidate. A candidate is only
-accepted when it reaches confidence 75/100; use
+Enable the Places API (New) for the Google Cloud project used by the key.
+Google Custom Search is available only to existing Custom Search JSON API
+customers. Tavily is the recommended web-search fallback for new accounts.
+Exa and Tavily are the recommended web-search fallbacks for new accounts. The
+Brave key is optional and is only used when earlier providers return no verified
+candidate. A candidate is only accepted when it reaches confidence 75/100; use
 `--min-confidence 85` for a stricter list. Rows still missing a site retain an
 explanation in `Website Discovery Notes`, which makes them suitable for manual
 review or a second search provider later.

@@ -219,3 +219,5 @@ __marimo__/
 
 excels
 *.ipynb
+*.csv
+*.zip

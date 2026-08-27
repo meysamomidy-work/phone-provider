@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Find official dealer sites missing from CarGurus and Google Maps.
 
-This uses Google Places API (New) and can fall back to the independent Brave
-Search API. It only accepts a candidate when the returned place/result agrees
-with the dealer's name and location/phone, and keeps original source columns
-intact.
+This uses Google Places API (New) and can fall back to Exa, Tavily, or the
+independent Brave Search API. It can also use Google Custom Search for existing
+API customers. It only accepts a candidate when the returned place/result
+agrees with the dealer's name and location/phone, and keeps original source
+columns intact.
 
 Example:
   python discover_websites.py enriched_new -o discovered --google-places-api-key YOUR_KEY
@@ -17,6 +18,7 @@ import logging
 import os
 import re
 import sys
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from difflib import SequenceMatcher
@@ -30,6 +32,16 @@ from tqdm import tqdm
 
 from dealer_fetch import fetch_dealer_html
 
+try:
+    from exa_py import Exa
+except ImportError:  # Keep Places/Tavily/Brave usable if Exa is not configured.
+    Exa = None  # type: ignore[assignment,misc]
+
+try:
+    from tavily import TavilyClient
+except ImportError:  # Keep Places/Exa/Brave usable if Tavily is not configured.
+    TavilyClient = None  # type: ignore[assignment,misc]
+
 log = logging.getLogger("discover_websites")
 
 PLACE_SEARCH_URL = "https://places.googleapis.com/v1/places:searchText"
@@ -42,6 +54,10 @@ DIRECTORY_HOSTS = frozenset({
     "google.com", "facebook.com", "instagram.com", "yelp.com", "cargurus.com",
     "cars.com", "autotrader.com", "carfax.com", "bbb.org", "mapquest.com",
     "yellowpages.com", "dealerrater.com", "kbb.com", "edmunds.com",
+    # Search-provider result/profile pages are evidence, never a dealer's own
+    # website. Without these exclusions an Exa library page can contain the
+    # dealer's name and accidentally pass the on-page matching checks.
+    "exa.ai", "tavily.com", "brave.com",
 })
 
 RESOLVED_WEBSITE_COL = "Resolved Website"
@@ -113,6 +129,7 @@ class DiscoveryResult:
     website: str = ""
     confidence: int = 0
     note: str = ""
+    source: str = ""
 
 
 class GooglePlacesFinder:
@@ -158,7 +175,173 @@ class GooglePlacesFinder:
         score, website, detail = best
         if score < min_confidence:
             return DiscoveryResult(confidence=score, note=f"Candidate below threshold ({detail})")
-        return DiscoveryResult(website=website, confidence=score, note=f"Google Places API; {detail}")
+        return DiscoveryResult(
+            website=website,
+            confidence=score,
+            note=f"Google Places API; {detail}",
+            source="Google Places API",
+        )
+
+
+def _verify_search_results(
+    name: str,
+    address: str,
+    phone: str,
+    results: list[dict[str, Any]],
+    *,
+    source: str,
+    min_confidence: int,
+    timeout: float,
+) -> DiscoveryResult:
+    """Verify result URLs from a web search before treating one as official."""
+    best: tuple[int, str, str] | None = None
+    for result in results[:3]:
+        website = str(result.get("url", "")).strip()
+        if not website or _host_is_directory(website):
+            continue
+        title = str(result.get("title", ""))
+        name_ratio = SequenceMatcher(None, _normal_text(name), _normal_text(title)).ratio()
+        if name_ratio < 0.55:
+            continue
+        score, detail = _candidate_score(
+            name, address, phone,
+            {"displayName": {"text": title}, "formattedAddress": "", "nationalPhoneNumber": ""},
+        )
+        try:
+            fetched = fetch_dealer_html(website, timeout=timeout, mode="http")
+        except Exception:
+            fetched = None
+        # A search-result title alone is not enough. The candidate must be a
+        # fetchable page that identifies the dealer itself.
+        if not fetched:
+            continue
+        _, html = fetched
+        page_tokens = _tokens(html)
+        name_tokens = _tokens(name)
+        if not name_tokens or len(name_tokens & page_tokens) < max(1, min(2, len(name_tokens))):
+            continue
+        score += 10
+        detail += "; dealer name appears on site"
+        if (zip_code := _zip(address)) and zip_code in html:
+            score += 10
+            detail += "; ZIP appears on site"
+        if (phone_digits := _phone_digits(phone)) and phone_digits in re.sub(r"\D", "", html):
+            score += 20
+            detail += "; phone appears on site"
+        if best is None or score > best[0]:
+            best = (min(score, 100), website, detail)
+    if best is None:
+        return DiscoveryResult(note=f"No verified dealer website in {source} results")
+    score, website, detail = best
+    if score < min_confidence:
+        return DiscoveryResult(confidence=score, note=f"Search candidate below threshold ({detail})")
+    return DiscoveryResult(
+        website=website,
+        confidence=score,
+        note=f"{source}; {detail}",
+        source=source,
+    )
+
+
+class GoogleCustomSearchFinder:
+    """Google web-search fallback for existing Custom Search JSON API users."""
+
+    endpoint = "https://www.googleapis.com/customsearch/v1"
+
+    def __init__(self, api_key: str, search_engine_id: str, timeout: float) -> None:
+        self.api_key = api_key
+        self.search_engine_id = search_engine_id
+        self.timeout = timeout
+
+    def find(self, name: str, address: str, phone: str, min_confidence: int) -> DiscoveryResult:
+        try:
+            response = requests.get(
+                self.endpoint,
+                params={
+                    "key": self.api_key,
+                    "cx": self.search_engine_id,
+                    "q": f'"{name}" "{address}"',
+                    "num": 3,
+                },
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+            items = response.json().get("items", [])
+        except requests.RequestException as exc:
+            return DiscoveryResult(note=f"Google Custom Search request failed: {exc}")
+        except ValueError:
+            return DiscoveryResult(note="Google Custom Search returned invalid JSON")
+        results = [
+            {"url": item.get("link", ""), "title": item.get("title", "")}
+            for item in items
+        ]
+        return _verify_search_results(
+            name, address, phone, results,
+            source="Google Custom Search", min_confidence=min_confidence, timeout=self.timeout,
+        )
+
+
+class ExaWebFinder:
+    """Exa web-search fallback for dealers without a verified Places result."""
+
+    def __init__(self, api_key: str, timeout: float) -> None:
+        self.timeout = timeout
+        self.client = Exa(api_key=api_key) if Exa is not None else None
+
+    def find(self, name: str, address: str, phone: str, min_confidence: int) -> DiscoveryResult:
+        if self.client is None:
+            return DiscoveryResult(note="Exa Search unavailable: install exa-py")
+        try:
+            response = self.client.search(
+                f'"{name}" "{address}"',
+                num_results=3,
+                type="auto",
+                contents={"highlights": True},
+            )
+            raw_results = getattr(response, "results", [])
+            results = [
+                {
+                    "url": getattr(item, "url", ""),
+                    "title": getattr(item, "title", ""),
+                }
+                for item in raw_results
+            ]
+        except Exception as exc:
+            return DiscoveryResult(note=f"Exa Search request failed: {exc}")
+
+        return _verify_search_results(
+            name, address, phone, results,
+            source="Exa Search", min_confidence=min_confidence, timeout=self.timeout,
+        )
+
+
+class TavilyWebFinder:
+    """Tavily web-search fallback for dealers without a verified Places result."""
+
+    def __init__(self, api_key: str, timeout: float) -> None:
+        self.timeout = timeout
+        self.client = TavilyClient(api_key=api_key) if TavilyClient is not None else None
+
+    def find(self, name: str, address: str, phone: str, min_confidence: int) -> DiscoveryResult:
+        if self.client is None:
+            return DiscoveryResult(note="Tavily Search unavailable: install tavily-python")
+        try:
+            response = self.client.search(
+                query=f'"{name}" "{address}"',
+                search_depth="advanced",
+                max_results=3,
+                include_answer=False,
+                include_raw_content=False,
+                topic="general",
+            )
+            results = response.get("results", [])
+        except Exception as exc:
+            return DiscoveryResult(note=f"Tavily Search request failed: {exc}")
+
+        return _verify_search_results(
+            name, address, phone, results,
+            source="Tavily Search", min_confidence=min_confidence, timeout=self.timeout,
+        )
 
 
 class BraveWebFinder:
@@ -186,41 +369,10 @@ class BraveWebFinder:
         except ValueError:
             return DiscoveryResult(note="Brave Search returned invalid JSON")
 
-        best: tuple[int, str, str] | None = None
-        for result in results[:10]:
-            website = str(result.get("url", "")).strip()
-            if not website or _host_is_directory(website):
-                continue
-            title = str(result.get("title", ""))
-            score, detail = _candidate_score(
-                name, address, phone,
-                {"displayName": {"text": title}, "formattedAddress": "", "nationalPhoneNumber": ""},
-            )
-            try:
-                fetched = fetch_dealer_html(website, timeout=self.timeout, mode="http")
-            except Exception:
-                fetched = None
-            if fetched:
-                _, html = fetched
-                page_tokens = _tokens(html)
-                name_tokens = _tokens(name)
-                if name_tokens and len(name_tokens & page_tokens) >= max(1, min(2, len(name_tokens))):
-                    score += 10
-                    detail += "; dealer name appears on site"
-                if (zip_code := _zip(address)) and zip_code in html:
-                    score += 10
-                    detail += "; ZIP appears on site"
-                if (phone_digits := _phone_digits(phone)) and phone_digits in re.sub(r"\D", "", html):
-                    score += 20
-                    detail += "; phone appears on site"
-            if best is None or score > best[0]:
-                best = (min(score, 100), website, detail)
-        if best is None:
-            return DiscoveryResult(note="No usable official-looking website in Brave Search")
-        score, website, detail = best
-        if score < min_confidence:
-            return DiscoveryResult(confidence=score, note=f"Search candidate below threshold ({detail})")
-        return DiscoveryResult(website=website, confidence=score, note=f"Brave Search; {detail}")
+        return _verify_search_results(
+            name, address, phone, results,
+            source="Brave Search", min_confidence=min_confidence, timeout=self.timeout,
+        )
 
 
 def _first_column(df: pd.DataFrame, choices: tuple[str, ...]) -> str | None:
@@ -300,6 +452,7 @@ def discover_file(path: Path, output: Path, finders: list[Any], args: argparse.N
         return idx, results[-1] if results else DiscoveryResult(note="No discovery provider configured")
 
     found = 0
+    found_by_source: Counter[str] = Counter()
     with ThreadPoolExecutor(max_workers=max(1, args.threads)) as pool:
         futures = {pool.submit(task, idx): idx for idx in pending}
         for future in tqdm(as_completed(futures), total=len(futures), desc=path.name, unit="dealer"):
@@ -308,18 +461,35 @@ def discover_file(path: Path, output: Path, finders: list[Any], args: argparse.N
             df.at[idx, DISCOVERY_NOTES_COL] = result.note
             if result.website:
                 df.at[idx, RESOLVED_WEBSITE_COL] = result.website
-                df.at[idx, RESOLVED_SOURCE_COL] = "Google Places API"
+                df.at[idx, RESOLVED_SOURCE_COL] = result.source or "Discovery provider"
                 found += 1
+                found_by_source[result.source or "Discovery provider"] += 1
 
     _write_table(df, output)
-    log.info("%s: %s existing, %s newly discovered, %s still missing -> %s", path.name, len(df) - len(pending), found, len(pending) - found, output)
+    source_summary = ", ".join(
+        f"{source}={count}"
+        for source, count in sorted(found_by_source.items())
+    ) or "none"
+    log.info(
+        "%s: %s existing, %s newly discovered (%s), %s still missing -> %s",
+        path.name,
+        len(df) - len(pending),
+        found,
+        source_summary,
+        len(pending) - found,
+        output,
+    )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Discover verified dealership websites via Google Places API")
+    parser = argparse.ArgumentParser(description="Discover verified dealership websites via Places and web search APIs")
     parser.add_argument("input", help="CSV/XLSX file or directory of files")
     parser.add_argument("-o", "--output", required=True, help="Output file, or output directory for directory input")
     parser.add_argument("--google-places-api-key", default=os.getenv("GOOGLE_MAPS_API_KEY", ""), help="Google Places API key (or set GOOGLE_MAPS_API_KEY)")
+    parser.add_argument("--google-custom-search-api-key", default=os.getenv("GOOGLE_CUSTOM_SEARCH_API_KEY", ""), help="Google Custom Search JSON API key (or set GOOGLE_CUSTOM_SEARCH_API_KEY)")
+    parser.add_argument("--google-custom-search-cx", default=os.getenv("GOOGLE_CUSTOM_SEARCH_CX", ""), help="Google Programmable Search Engine ID (or set GOOGLE_CUSTOM_SEARCH_CX)")
+    parser.add_argument("--exa-api-key", default=os.getenv("EXA_API_KEY", ""), help="Exa Search API key (or set EXA_API_KEY)")
+    parser.add_argument("--tavily-api-key", default=os.getenv("TAVILY_API_KEY", ""), help="Tavily Search API key (or set TAVILY_API_KEY)")
     parser.add_argument("--brave-search-api-key", default=os.getenv("BRAVE_SEARCH_API_KEY", ""), help="Optional independent Brave Search API key (or set BRAVE_SEARCH_API_KEY)")
     parser.add_argument("--name-col")
     parser.add_argument("--address-col")
@@ -328,8 +498,10 @@ def main() -> None:
     parser.add_argument("-t", "--threads", type=int, default=4, help="Concurrent API requests (default: 4)")
     parser.add_argument("--timeout", type=float, default=20.0)
     args = parser.parse_args()
-    if not args.google_places_api_key and not args.brave_search_api_key:
-        parser.error("provide --google-places-api-key, --brave-search-api-key, or both")
+    if bool(args.google_custom_search_api_key) != bool(args.google_custom_search_cx):
+        parser.error("Google Custom Search requires both --google-custom-search-api-key and --google-custom-search-cx")
+    if not (args.google_places_api_key or args.google_custom_search_api_key or args.exa_api_key or args.tavily_api_key or args.brave_search_api_key):
+        parser.error("provide a Google Places, Google Custom Search, Exa, Tavily, or Brave Search API key")
     if not 0 <= args.min_confidence <= 100:
         parser.error("--min-confidence must be between 0 and 100")
 
@@ -349,6 +521,18 @@ def main() -> None:
     finders: list[Any] = []
     if args.google_places_api_key:
         finders.append(GooglePlacesFinder(args.google_places_api_key, args.timeout))
+    if args.exa_api_key:
+        finders.append(ExaWebFinder(args.exa_api_key, args.timeout))
+    if args.tavily_api_key:
+        finders.append(TavilyWebFinder(args.tavily_api_key, args.timeout))
+    if args.google_custom_search_api_key:
+        finders.append(
+            GoogleCustomSearchFinder(
+                args.google_custom_search_api_key,
+                args.google_custom_search_cx,
+                args.timeout,
+            )
+        )
     if args.brave_search_api_key:
         finders.append(BraveWebFinder(args.brave_search_api_key, args.timeout))
     for file, output in zip(files, output_paths):
