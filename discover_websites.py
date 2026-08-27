@@ -54,11 +54,19 @@ DIRECTORY_HOSTS = frozenset({
     "google.com", "facebook.com", "instagram.com", "yelp.com", "cargurus.com",
     "cars.com", "autotrader.com", "carfax.com", "bbb.org", "mapquest.com",
     "yellowpages.com", "dealerrater.com", "kbb.com", "edmunds.com",
+    # Social profiles are not the dealership's own website.
+    "linkedin.com", "x.com", "twitter.com", "youtube.com", "tiktok.com",
+    "pinterest.com", "threads.net", "snapchat.com", "whatsapp.com",
     # Search-provider result/profile pages are evidence, never a dealer's own
     # website. Without these exclusions an Exa library page can contain the
     # dealer's name and accidentally pass the on-page matching checks.
     "exa.ai", "tavily.com", "brave.com",
 })
+CAPTCHA_MARKERS = (
+    "captcha", "cf-turnstile", "challenges.cloudflare.com", "just a moment",
+    "verify you are human", "checking your browser", "g-recaptcha", "hcaptcha",
+)
+CAPTCHA_URL_MIN_CONFIDENCE = 90
 
 RESOLVED_WEBSITE_COL = "Resolved Website"
 RESOLVED_SOURCE_COL = "Resolved Website Source"
@@ -94,6 +102,42 @@ def _host_is_directory(url: str) -> bool:
     if host.startswith("www."):
         host = host[4:]
     return any(host == directory or host.endswith("." + directory) for directory in DIRECTORY_HOSTS)
+
+
+def _url_name_score(dealer_name: str, website: str) -> tuple[int, str]:
+    """Return conservative evidence that a candidate URL belongs to this dealer."""
+    parsed = urlparse(website)
+    host_and_path = f"{parsed.netloc}{parsed.path}".lower()
+    dealer_key = _normal_text(dealer_name)
+    url_key = _normal_text(host_and_path)
+    if dealer_key and dealer_key in url_key:
+        return 30, "full dealer name appears in URL"
+
+    hostname = parsed.netloc.lower().removeprefix("www.")
+    host_key = _normal_text(hostname)
+    ratio = SequenceMatcher(None, dealer_key, host_key).ratio()
+    if ratio >= 0.85:
+        return 25, f"dealer/domain similarity={ratio:.2f}"
+
+    overlap = _tokens(dealer_name) & _tokens(hostname.replace(".", " ").replace("-", " "))
+    if len(overlap) >= 2:
+        return min(20, len(overlap) * 8), "multiple dealer tokens appear in domain"
+    return 0, "no strong dealer/domain match"
+
+
+def _is_captcha_page(url: str, timeout: float) -> bool:
+    """Use a small direct check only after the normal fetch was blocked."""
+    try:
+        response = requests.get(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; DealerWebsiteDiscovery/1.0)"},
+            timeout=min(timeout, 10.0),
+            allow_redirects=True,
+        )
+        body = response.text.lower()
+    except requests.RequestException:
+        return False
+    return any(marker in body for marker in CAPTCHA_MARKERS)
 
 
 def _candidate_score(
@@ -213,10 +257,23 @@ def _verify_search_results(
             fetched = fetch_dealer_html(website, timeout=timeout, mode="http")
         except Exception:
             fetched = None
+        if not fetched:
+            # A CAPTCHA prevents page-level verification. It can only be
+            # accepted when both the search result and the actual URL provide
+            # very strong identity evidence; ordinary fetch failures remain
+            # rejected.
+            if not _is_captcha_page(website, timeout):
+                continue
+            url_score, url_detail = _url_name_score(name, website)
+            captcha_score = min(100, score + url_score)
+            if url_score and captcha_score >= max(min_confidence, CAPTCHA_URL_MIN_CONFIDENCE):
+                captcha_detail = f"{detail}; CAPTCHA page; {url_detail}"
+                if best is None or captcha_score > best[0]:
+                    best = (captcha_score, website, captcha_detail)
+            continue
+
         # A search-result title alone is not enough. The candidate must be a
         # fetchable page that identifies the dealer itself.
-        if not fetched:
-            continue
         _, html = fetched
         page_tokens = _tokens(html)
         name_tokens = _tokens(name)

@@ -25,6 +25,10 @@ page before accepting a site. No source overwrites the original `Website` or
 `Google Map Website` columns. It produces `Resolved Website`, which
 `enrich_dealers.py` now chooses first.
 
+Social-media, directory, and search-provider profile URLs are rejected. If a
+candidate site presents a CAPTCHA, it can be accepted only when its title and
+domain strongly match the dealership (at least 90/100 confidence).
+
 ```powershell
 python discover_websites.py ..\google-maps\enriched_new `
   -o discovered `
