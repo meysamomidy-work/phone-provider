@@ -49,15 +49,9 @@ FALLBACK_PATHS = (
     # "/search",
 )
 
-_CHALLENGE_MARKERS = (
+_CHALLENGE_TEXT_MARKERS = (
     "just a moment",
     "cf_chl_opt",
-    "challenges.cloudflare.com",
-    "cf-turnstile",
-    "turnstile.render",
-    "hcaptcha.com",
-    "google.com/recaptcha",
-    "g-recaptcha",
     "verify you are human",
     "verify that you are human",
     "checking your browser",
@@ -67,8 +61,6 @@ _CHALLENGE_MARKERS = (
     "ray id",
     "cf-browser-verification",
     "bot detection",
-    "blocked",
-    "captcha",
 )
 
 MIN_HTML_BYTES = 2_500
@@ -83,11 +75,54 @@ class FetchMode(str, Enum):
     BROWSER = "browser"
 
 
-def is_challenge_page(html: str) -> bool:
+def _page_title(html: str) -> str:
+    match = re.search(r"<title[^>]*>(.*?)</title>", html or "", re.I | re.S)
+    return re.sub(r"\s+", " ", match.group(1)).strip().lower() if match else ""
+
+
+def _visible_page_text(html: str) -> str:
+    """Extract enough visible text for challenge classification.
+
+    Scripts often reference reCAPTCHA, Turnstile, or a "blocked" state on a
+    perfectly normal dealer website, so raw HTML substring checks are noisy.
+    """
+    without_nonvisible = re.sub(r"<(?:script|style|noscript|template)\b[^>]*>.*?</(?:script|style|noscript|template)>", " ", html or "", flags=re.I | re.S)
+    text = re.sub(r"<[^>]+>", " ", without_nonvisible)
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+
+def challenge_reason(html: str) -> str:
+    """Return the reason a document is a real interstitial challenge, if any."""
     if not html or len(html) < 200:
-        return True
+        return "empty or very short response"
+
+    title = _page_title(html)
+    text = _visible_page_text(html)
+    # These phrases are only meaningful in the rendered page/title. Do not
+    # classify a normal page just because an embedded form uses reCAPTCHA.
+    for marker in _CHALLENGE_TEXT_MARKERS:
+        if marker in title or marker in text:
+            return f"visible challenge marker: {marker!r}"
+
+    # A real Cloudflare/Turnstile interstitial can be mostly markup with very
+    # little text. Require its infrastructure marker *and* a challenge-like
+    # title/body signal; an ordinary Turnstile contact form is not a block.
     low = html.lower()
-    return any(m in low for m in _CHALLENGE_MARKERS)
+    has_challenge_infrastructure = any(
+        marker in low
+        for marker in ("challenges.cloudflare.com", "cf-turnstile", "turnstile.render", "hcaptcha.com")
+    )
+    has_challenge_context = any(
+        marker in f"{title} {text}"
+        for marker in ("security check", "verify", "challenge", "checking")
+    )
+    if has_challenge_infrastructure and has_challenge_context:
+        return "challenge infrastructure with visible verification context"
+    return ""
+
+
+def is_challenge_page(html: str) -> bool:
+    return bool(challenge_reason(html))
 
 
 def is_usable_html(html: str, *, status: int = 200) -> bool:
@@ -194,9 +229,10 @@ def fetch_http(
                 log.debug("http fetch failed %s (%s): %s", url, impersonate, exc)
                 continue
 
-            if is_challenge_page(html):
+            reason = challenge_reason(html)
+            if reason:
                 challenge_seen = True
-                log.debug("challenge page %s (%s bytes)", url, len(html))
+                log.debug("challenge page %s (%s bytes; %s)", url, len(html), reason)
                 continue
 
             if is_usable_html(html, status=status):
@@ -277,8 +313,9 @@ def fetch_browser(
                 log.debug("browser ok %s (%s bytes)", final_url, len(html))
                 return final_url, html, label
 
-            if is_challenge_page(html):
-                log.info("browser still on challenge page for %s", url)
+            reason = challenge_reason(html)
+            if reason:
+                log.info("browser still on challenge page for %s (%s; title=%r)", url, reason, _page_title(html))
             else:
                 log.info("browser page too small or non-200 content for %s (%s bytes)", url, len(html))
             return None
@@ -375,6 +412,9 @@ def fetch_browser_with_resources(
                 resource_urls.update(extract_resource_urls(html, final_url))
                 log.debug("browser resources ok %s (%s resources)", final_url, len(resource_urls))
                 return final_url, html, label, resource_urls
+            reason = challenge_reason(html)
+            if reason:
+                log.info("browser resource fetch still on challenge page for %s (%s; title=%r)", url, reason, _page_title(html))
             return None
         except Exception as exc:
             log.warning("browser resource fetch failed %s: %s", url, exc)

@@ -566,7 +566,16 @@ def _process_row(
         else ""
     )
     customer_ai = (
-        _combine_detection_values([detect_customer_ai(page) for page in detection_pages])
+        _combine_detection_values(
+            [
+                detect_customer_ai(
+                    page,
+                    source_url=final_url,
+                    website_provider=provider_name or existing[OUTPUT_PROVIDER_COL],
+                )
+                for page in detection_pages
+            ]
+        )
         if not _has_enrichment_value(existing[OUTPUT_CUSTOMER_AI_COL])
         else ""
     )

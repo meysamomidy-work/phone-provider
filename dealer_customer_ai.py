@@ -25,6 +25,18 @@ _VENDOR_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Dealerbot", ("dealerbot.co.uk", "dealerbot")),
 )
 
+# Apollo AssistantAI is native to Team Velocity's website platform, rather
+# than a conventional third-party iframe.  A Team Velocity site alone is not
+# enough to establish that the optional AI assistant is enabled, so these
+# markers are only used with direct assistant evidence below.
+_TEAM_VELOCITY_MARKERS = (
+    "teamvelocitymarketing.com",
+    "teamvelocity.com",
+    "apollo assistantai",
+    "apolloassistantai",
+    "assistantai",
+)
+
 # Require an AI claim together with an actual conversational-control signal.
 # This prevents a dealer's blog post or a marketing script from becoming a
 # false positive.
@@ -41,14 +53,36 @@ _CONVERSATION_CONTROL = re.compile(
 )
 
 
-def detect_customer_ai(html: str) -> str:
-    """Return comma-separated AI providers or an explicit generic AI result."""
+def detect_customer_ai(
+    html: str,
+    *,
+    source_url: str = "",
+    website_provider: str = "",
+) -> str:
+    """Return customer-facing AI provider(s), using known site-platform context.
+
+    ``website_provider`` must be the provider detected from the dealer page,
+    not a guess from the dealer's own business name.  This lets a native
+    assistant be attributed without marking every site on that platform as AI.
+    """
     if not html:
         return ""
     low = html.lower()
+    platform_context = f"{source_url} {website_provider}".lower()
+    has_team_velocity = (
+        "team velocity" in platform_context
+        or any(marker in low for marker in _TEAM_VELOCITY_MARKERS[:2])
+    )
+    has_apollo_assistant = any(marker in low for marker in _TEAM_VELOCITY_MARKERS[2:])
+
+    if has_apollo_assistant:
+        return "Team Velocity Apollo AssistantAI"
+
     found = [name for name, markers in _VENDOR_MARKERS if any(marker in low for marker in markers)]
     if found:
         return ", ".join(found)
     if _EXPLICIT_AI.search(html) and _CONVERSATION_CONTROL.search(html):
+        if has_team_velocity:
+            return "Team Velocity Apollo AssistantAI"
         return "AI customer assistant (vendor unknown)"
     return ""
