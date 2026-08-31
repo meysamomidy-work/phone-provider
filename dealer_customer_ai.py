@@ -37,6 +37,32 @@ _TEAM_VELOCITY_MARKERS = (
     "assistantai",
 )
 
+# Dealer Inspire's native customer-messaging product is Conversations. Its
+# customer AI has been marketed as Ana Bot and, more recently, a Generative-AI
+# Virtual Assistant. As with Apollo, the website platform itself is not proof
+# that a dealer has enabled the optional AI module.
+_DEALER_INSPIRE_PLATFORM_MARKERS = (
+    "dealerinspire.com",
+    "dealer-inspire-inventory",
+    "dealer inspire",
+)
+_DEALER_INSPIRE_ASSISTANT_MARKERS = (
+    "ana bot",
+    "conversations genai",
+    "conversations virtual assistant",
+    "dealer inspire virtual assistant",
+)
+
+# These vendors also offer ordinary messaging products.  Therefore a delivery
+# hostname by itself is not enough: these names are returned only after the
+# page has already met the explicit customer-AI + conversation-control test.
+_AI_CHAT_VENDOR_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("Impel Chat AI", ("impel.io", "impel.ai", "spincar.com")),
+    ("Gubagoo GubaIQ", ("gubagoo.com", "gubaiq")),
+    ("Podium AI (Jerry)", ("podium.com", "podium-widget")),
+    ("DriveCentric AI Agents", ("drivecentric.com", "drive centric")),
+)
+
 # Require an AI claim together with an actual conversational-control signal.
 # This prevents a dealer's blog post or a marketing script from becoming a
 # false positive.
@@ -74,15 +100,33 @@ def detect_customer_ai(
         or any(marker in low for marker in _TEAM_VELOCITY_MARKERS[:2])
     )
     has_apollo_assistant = any(marker in low for marker in _TEAM_VELOCITY_MARKERS[2:])
+    has_dealer_inspire = (
+        "dealer inspire" in platform_context
+        or any(marker in low for marker in _DEALER_INSPIRE_PLATFORM_MARKERS[:2])
+    )
+    has_dealer_inspire_assistant = any(
+        marker in low for marker in _DEALER_INSPIRE_ASSISTANT_MARKERS
+    )
 
     if has_apollo_assistant:
         return "Team Velocity Apollo AssistantAI"
+    if has_dealer_inspire_assistant and has_dealer_inspire:
+        return "Dealer Inspire Conversations (Virtual Assistant)"
 
     found = [name for name, markers in _VENDOR_MARKERS if any(marker in low for marker in markers)]
     if found:
         return ", ".join(found)
     if _EXPLICIT_AI.search(html) and _CONVERSATION_CONTROL.search(html):
+        matched_ai_chat_vendors = [
+            vendor_name
+            for vendor_name, markers in _AI_CHAT_VENDOR_MARKERS
+            if any(marker in low for marker in markers)
+        ]
+        if matched_ai_chat_vendors:
+            return ", ".join(matched_ai_chat_vendors)
         if has_team_velocity:
             return "Team Velocity Apollo AssistantAI"
+        if has_dealer_inspire:
+            return "Dealer Inspire Conversations (Virtual Assistant)"
         return "AI customer assistant (vendor unknown)"
     return ""
