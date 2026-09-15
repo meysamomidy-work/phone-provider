@@ -20,6 +20,14 @@ python enrich_dealers.py ..\google-maps\enriched_new\dealers.csv `
   --staff-emails-only -t 2 --fetch-mode auto
 ```
 
+The worker launcher supports the same focused pass. Its fifth positional
+argument selects `deep` (default), `standard`, or `staff`; the optional sixth
+argument sets the staff-page limit:
+
+```bat
+run_workers.bat dealers.csv 6 2 0 staff 8
+```
+
 `Staff Emails` is compact JSON so CSV and Excel consumers retain the person
 context together, for example:
 
