@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import csv
 import html as html_lib
+import json
 import logging
 import re
 import sys
@@ -30,7 +31,12 @@ from tqdm import tqdm
 from dealer_chat_widget import detect_chat_widgets
 from dealer_360_imaging import detect_360_viewers
 from dealer_customer_ai import detect_customer_ai
-from dealer_email import extract_primary_email
+from dealer_email import (
+    extract_primary_email,
+    extract_staff_email_records,
+    find_staff_page_urls,
+    merge_staff_email_records,
+)
 from dealer_phone import extract_primary_phone
 from dealer_platforms import DEALER_PLATFORMS
 from dealer_type import classify_dealer_type
@@ -83,6 +89,7 @@ NAME_COLUMN_CANDIDATES = (
 OUTPUT_PROVIDER_COL = "Website Provider"
 OUTPUT_PHONE_COL = "Website Phone"
 OUTPUT_EMAIL_COL = "Website Email"
+OUTPUT_STAFF_EMAILS_COL = "Staff Emails"
 OUTPUT_CHAT_WIDGET_COL = "Chat Widget"
 OUTPUT_360_VIEWER_COL = "360° Vehicle Viewer"
 OUTPUT_CUSTOMER_AI_COL = "Customer AI"
@@ -797,6 +804,228 @@ def enrich_file(
     )
 
 
+def _staff_email_column(df: pd.DataFrame) -> str:
+    """Use a supplied staff-email column spelling, or the canonical new one."""
+    for column in df.columns:
+        if str(column).strip().lower() == OUTPUT_STAFF_EMAILS_COL.lower():
+            return str(column)
+    return OUTPUT_STAFF_EMAILS_COL
+
+
+def _staff_output_columns(df: pd.DataFrame, staff_email_col: str) -> list[str]:
+    """Preserve every source column; the staff JSON field is append-only."""
+    columns = list(df.columns)
+    if staff_email_col not in columns:
+        columns.append(staff_email_col)
+    return columns
+
+
+def _fetch_staff_page(
+    url: str,
+    *,
+    timeout: float,
+    fetch_mode: str,
+    headed: bool,
+) -> tuple[str, str] | None:
+    """Fetch exactly one discovered page instead of falling back to the home URL."""
+    parsed = urlparse(url)
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+    return fetch_dealer_html(
+        url,
+        timeout=timeout,
+        paths=(path,),
+        mode=fetch_mode,
+        headed=headed,
+    )
+
+
+def _collect_staff_records(
+    website: str,
+    *,
+    timeout: float,
+    fetch_mode: str,
+    headed: bool,
+    page_limit: int,
+) -> tuple[list[dict[str, str]], bool, int]:
+    """Scan a dealer homepage plus a bounded set of likely staff/contact pages."""
+    base = normalize_dealer_url(str(website) if website is not None else "")
+    if not base:
+        return [], False, 0
+
+    homepage = fetch_dealer_html(
+        base,
+        timeout=timeout,
+        mode=fetch_mode,
+        headed=headed,
+    )
+    if not homepage:
+        return [], False, 0
+
+    homepage_url, homepage_html = homepage
+    records = extract_staff_email_records(homepage_html, homepage_url)
+    pages_scanned = 1
+    seen_urls = {homepage_url.rstrip("/")}
+    for page_url in find_staff_page_urls(homepage_html, homepage_url, limit=page_limit):
+        # Nav menus occasionally link back to the home page.  Avoid paying for
+        # a duplicate fetch when that happened via a relative or www URL.
+        canonical = page_url.rstrip("/")
+        if canonical in seen_urls:
+            continue
+        seen_urls.add(canonical)
+        try:
+            fetched = _fetch_staff_page(
+                page_url,
+                timeout=timeout,
+                fetch_mode=fetch_mode,
+                headed=headed,
+            )
+        except Exception as exc:
+            log.debug("staff-email page fetch failed %s: %s", page_url, exc)
+            continue
+        if not fetched:
+            continue
+        final_url, page_html = fetched
+        pages_scanned += 1
+        records.extend(extract_staff_email_records(page_html, final_url))
+    return merge_staff_email_records(records), True, pages_scanned
+
+
+def enrich_staff_emails_file(
+    input_path: Path,
+    output_path: Path,
+    *,
+    website_col: str | None,
+    state_col: str | None,
+    threads: int,
+    timeout: float,
+    csv_sep: str = DEFAULT_CSV_SEP,
+    worker: int = 0,
+    total_workers: int = 1,
+    shard_rows: bool = False,
+    fetch_mode: str = FetchMode.AUTO.value,
+    headed: bool = False,
+    page_limit: int = 8,
+) -> None:
+    """Append public staff-email JSON without changing or dropping source data."""
+    if input_path.resolve() == output_path.resolve():
+        raise ValueError(
+            "Staff-email enrichment will not overwrite its input. Choose a different --output path."
+        )
+    if fetch_mode in (FetchMode.BROWSER.value, FetchMode.AUTO.value) and threads > 2:
+        log.warning(
+            "Browser fallback with %s threads can be unstable; use -t 1 or -t 2 for browser/auto",
+            threads,
+        )
+
+    df = _read_table(input_path, csv_sep=csv_sep)
+    total_rows = len(df)
+    if shard_rows and total_workers > 1:
+        state_column = _find_state_column(df, state_col)
+        df, shard_desc = _apply_worker_shard(df, worker, total_workers, state_col=state_column)
+        log.info(
+            "Staff-email worker %s/%s on %s: %s (%s of %s rows)",
+            worker + 1,
+            total_workers,
+            input_path.name,
+            shard_desc,
+            len(df),
+            total_rows,
+        )
+        if df.empty:
+            log.warning("Worker %s/%s: no rows in shard; skipping file", worker + 1, total_workers)
+            return
+
+    website_column = _find_website_column(df, website_col)
+    staff_email_column = _staff_email_column(df)
+    log.info(
+        "Staff-email input %s: %s rows, website column %r, up to %s linked pages/site",
+        input_path.name,
+        len(df),
+        website_column,
+        page_limit,
+    )
+
+    results: dict[int, str] = {}
+    rows_to_scan: list[tuple[int, str]] = []
+    no_website = 0
+    already_present = 0
+    for idx, value in df[website_column].items():
+        existing = (
+            _serialize_cell(df.at[idx, staff_email_column])
+            if staff_email_column in df.columns
+            else ""
+        )
+        if _has_enrichment_value(existing):
+            # This includes []: an earlier run intentionally found no public
+            # emails, and reruns must not replace a supplied value.
+            results[idx] = existing
+            already_present += 1
+            continue
+        url = normalize_dealer_url(str(value) if pd.notna(value) else "")
+        if not url:
+            results[idx] = "[]"
+            no_website += 1
+            continue
+        rows_to_scan.append((idx, str(value)))
+
+    def task(item: tuple[int, str]) -> tuple[int, str, bool, int]:
+        idx, website = item
+        try:
+            records, loaded, pages_scanned = _collect_staff_records(
+                website,
+                timeout=timeout,
+                fetch_mode=fetch_mode,
+                headed=headed,
+                page_limit=page_limit,
+            )
+            return idx, json.dumps(records, ensure_ascii=False, separators=(",", ":")), loaded, pages_scanned
+        except Exception as exc:
+            # One unusual dealer CMS must not prevent the rest of the CSV from
+            # receiving its new append-only column.
+            log.warning("Staff-email scan failed for %s: %s", website, exc)
+            return idx, "[]", False, 0
+
+    unloaded = 0
+    linked_pages_scanned = 0
+    if rows_to_scan:
+        with ThreadPoolExecutor(max_workers=max(1, threads)) as pool:
+            futures = {pool.submit(task, item): item[0] for item in rows_to_scan}
+            for future in tqdm(
+                as_completed(futures),
+                total=len(futures),
+                desc=f"staff emails: {input_path.name}",
+                unit="site",
+            ):
+                idx, staff_json, loaded, pages_scanned = future.result()
+                results[idx] = staff_json
+                linked_pages_scanned += max(pages_scanned - 1, 0)
+                if not loaded:
+                    unloaded += 1
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    writer = IncrementalWriter(output_path, _staff_output_columns(df, staff_email_column))
+    try:
+        for idx in df.index:
+            row = {column: df.at[idx, column] for column in df.columns}
+            row[staff_email_column] = results.get(idx, "[]")
+            writer.append(row)
+    finally:
+        writer.close()
+
+    log.info(
+        "Wrote %s (%s rows: %s no website, %s already populated, %s fetched, %s site not loaded, %s linked pages scanned)",
+        output_path,
+        writer.count,
+        no_website,
+        already_present,
+        len(rows_to_scan),
+        unloaded,
+        linked_pages_scanned,
+    )
+
+
 def _sniff_csv_delimiter(path: Path, *, encoding: str) -> str:
     with open(path, newline="", encoding=encoding, errors="replace") as f:
         sample = f.read(65536)
@@ -1041,6 +1270,21 @@ def main() -> None:
         help="Vehicle-detail pages to sample with --deep-detection (default: 3)",
     )
     parser.add_argument(
+        "--staff-emails-only",
+        action="store_true",
+        help=(
+            "Only append the Staff Emails JSON column. Scans the homepage plus likely "
+            "contact/team/staff pages; skips provider, phone, chat, 360, AI, and type enrichment."
+        ),
+    )
+    parser.add_argument(
+        "--staff-page-limit",
+        type=int,
+        default=8,
+        metavar="N",
+        help="Maximum same-site contact/team/staff pages per dealer with --staff-emails-only (default: 8)",
+    )
+    parser.add_argument(
         "--csv-sep",
         default=DEFAULT_CSV_SEP,
         help=f"Column separator for .csv inputs (default: {DEFAULT_CSV_SEP!r})",
@@ -1057,6 +1301,8 @@ def main() -> None:
         _validate_worker_args(args.worker, args.total_workers)
         if args.vdp_sample_size < 0:
             raise ValueError("--vdp-sample-size must be >= 0")
+        if args.staff_page_limit < 0:
+            raise ValueError("--staff-page-limit must be >= 0")
     except ValueError as exc:
         log.error("%s", exc)
         sys.exit(1)
@@ -1099,23 +1345,40 @@ def main() -> None:
     for inp in inputs:
         out = _resolve_output_path(inp, output_root, explicit_out)
         try:
-            enrich_file(
-                inp,
-                out,
-                website_col=args.website_col,
-                name_col=args.name_col,
-                state_col=args.state_col,
-                threads=args.threads,
-                timeout=args.timeout,
-                csv_sep=args.csv_sep,
-                worker=args.worker,
-                total_workers=args.total_workers,
-                shard_rows=shard_rows,
-                fetch_mode=args.fetch_mode,
-                headed=args.browser_headed,
-                deep_detection=args.deep_detection,
-                vdp_sample_size=args.vdp_sample_size,
-            )
+            if args.staff_emails_only:
+                enrich_staff_emails_file(
+                    inp,
+                    out,
+                    website_col=args.website_col,
+                    state_col=args.state_col,
+                    threads=args.threads,
+                    timeout=args.timeout,
+                    csv_sep=args.csv_sep,
+                    worker=args.worker,
+                    total_workers=args.total_workers,
+                    shard_rows=shard_rows,
+                    fetch_mode=args.fetch_mode,
+                    headed=args.browser_headed,
+                    page_limit=args.staff_page_limit,
+                )
+            else:
+                enrich_file(
+                    inp,
+                    out,
+                    website_col=args.website_col,
+                    name_col=args.name_col,
+                    state_col=args.state_col,
+                    threads=args.threads,
+                    timeout=args.timeout,
+                    csv_sep=args.csv_sep,
+                    worker=args.worker,
+                    total_workers=args.total_workers,
+                    shard_rows=shard_rows,
+                    fetch_mode=args.fetch_mode,
+                    headed=args.browser_headed,
+                    deep_detection=args.deep_detection,
+                    vdp_sample_size=args.vdp_sample_size,
+                )
         except Exception as exc:
             log.error("%s: %s", inp, exc)
             sys.exit(1)

@@ -1,9 +1,20 @@
-"""Extract dealer email addresses from dealer website HTML."""
+"""Extract general and staff email addresses from dealership website HTML.
+
+The normal website-enrichment flow uses :func:`extract_primary_email`.  The
+staff-email pass additionally uses :func:`find_staff_page_urls` to select a
+small set of likely contact/team pages, then stores records from
+:func:`extract_staff_email_records` as JSON.  The parsing deliberately relies
+only on the standard library so it also works in the project's lightweight
+HTTP-only setup.
+"""
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 import json
 import re
 from html import unescape
+from html.parser import HTMLParser
+from urllib.parse import unquote, urldefrag, urljoin, urlparse
 
 _MAILTO_RE = re.compile(r"href\s*=\s*['\"]mailto:([^'\"?]+)", re.I)
 _JSON_LD_RE = re.compile(
@@ -25,6 +36,35 @@ _META_EMAIL_RE = re.compile(
 _EMAIL_RE = re.compile(
     r"\b([a-zA-Z0-9][a-zA-Z0-9._%+-]*@[a-zA-Z0-9][a-zA-Z0-9.-]*\.[a-zA-Z]{2,})\b"
 )
+_OBFUSCATED_EMAIL_RE = re.compile(
+    r"\b([a-zA-Z0-9][a-zA-Z0-9._%+-]*)\s*"
+    r"(?:\[\s*at\s*\]|\(\s*at\s*\)|\{\s*at\s*\}|@|\bat\b)\s*"
+    r"([a-zA-Z0-9-]+(?:\s*(?:\[\s*dot\s*\]|\(\s*dot\s*\)|\{\s*dot\s*\}|\bdot\b|\.)\s*"
+    r"[a-zA-Z0-9-]+)+)\b",
+    re.I,
+)
+_CF_EMAIL_RE = re.compile(r"data-cfemail\s*=\s*['\"]([0-9a-f]+)['\"]", re.I)
+
+_VOID_TAGS = frozenset({"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"})
+_PERSON_CONTAINER_RE = re.compile(
+    r"(?:staff|team|employee|people|person|profile|bio|member|associate|advisor|consultant|"
+    r"leadership|management|manager|director|salesperson|sales-rep|representative)",
+    re.I,
+)
+# Do not treat a whole ``staff-card`` / ``team-member`` container as a name;
+# the name normally lives in a descendant heading or a more specific *-name
+# element.  Broad person-card labels are handled by the heading fallback.
+_NAME_HINT_RE = re.compile(r"(?:name|full[-_ ]?name)", re.I)
+_ROLE_HINT_RE = re.compile(
+    r"(?:job[-_ ]?title|position|designation|role|title|department|job|rank)", re.I
+)
+_STAFF_LINK_RE = re.compile(
+    r"(?:contact(?:[-_ ]?us)?|staff|our[-_ ]?team|meet[-_ ]?(?:the[-_ ]?)?(?:team|staff)|"
+    r"team|people|leadership|management|directory|employees?|associates?|our[-_ ]?people|"
+    r"who[-_ ]?we[-_ ]?are|about[-_ ]?us|dealership[-_ ]?team|meet[-_ ]?our)",
+    re.I,
+)
+_NON_PAGE_SUFFIX_RE = re.compile(r"\.(?:pdf|jpg|jpeg|png|gif|webp|svg|zip|mp4|css|js)(?:$|[?#])", re.I)
 
 _INVALID_LOCAL_PARTS = frozenset(
     {
@@ -60,28 +100,24 @@ _BLOCKED_DOMAINS = frozenset(
     }
 )
 
-_BLOCKED_SUFFIXES = (
-    ".png",
-    ".jpg",
-    ".jpeg",
-    ".gif",
-    ".svg",
-    ".webp",
-    ".css",
-    ".js",
-)
+_BLOCKED_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".css", ".js")
 
 
 def _normalize_email(raw: str) -> str | None:
+    """Return a safe canonical email address, or ``None`` for placeholders."""
     if not raw:
         return None
-    text = unescape(raw).strip().lower()
+    text = unquote(unescape(raw)).strip().lower()
+    if text.lower().startswith("mailto:"):
+        text = text[7:]
+    text = text.split("?", 1)[0].strip()
     if not text or "@" not in text:
         return None
     if any(text.endswith(s) for s in _BLOCKED_SUFFIXES):
         return None
 
     local, _, domain = text.rpartition("@")
+    domain = domain.rstrip(".")
     if not local or not domain or "." not in domain:
         return None
     if domain in _BLOCKED_DOMAINS:
@@ -97,11 +133,48 @@ def _normalize_email(raw: str) -> str | None:
     return f"{local}@{domain}"
 
 
+def _decode_cloudflare_email(value: str) -> str | None:
+    """Decode Cloudflare's public ``data-cfemail`` obfuscation attribute."""
+    try:
+        data = bytes.fromhex(value)
+    except ValueError:
+        return None
+    if len(data) < 2:
+        return None
+    key = data[0]
+    return "".join(chr(byte ^ key) for byte in data[1:])
+
+
+def _obfuscated_email_candidates(text: str) -> list[str]:
+    candidates: list[str] = []
+    for local, domain in _OBFUSCATED_EMAIL_RE.findall(unescape(text or "")):
+        normalized_domain = re.sub(
+            r"\s*(?:\[\s*dot\s*\]|\(\s*dot\s*\)|\{\s*dot\s*\}|\bdot\b)\s*",
+            ".",
+            domain,
+            flags=re.I,
+        )
+        candidates.append(f"{local}@{normalized_domain.replace(' ', '')}")
+    return candidates
+
+
+def _email_candidates(text: str) -> list[str]:
+    """Extract direct, encoded, and common human-readable obfuscated emails."""
+    value = unescape(text or "")
+    candidates = _EMAIL_RE.findall(value)
+    candidates.extend(_obfuscated_email_candidates(value))
+    for encoded in _CF_EMAIL_RE.findall(value):
+        decoded = _decode_cloudflare_email(encoded)
+        if decoded:
+            candidates.append(decoded)
+    return candidates
+
+
 def _emails_from_json_ld(html: str) -> list[str]:
     found: list[str] = []
     for block in _JSON_LD_RE.findall(html):
         try:
-            data = json.loads(block.strip())
+            data = json.loads(unescape(block.strip()))
         except json.JSONDecodeError:
             continue
         stack = data if isinstance(data, list) else [data]
@@ -113,9 +186,9 @@ def _emails_from_json_ld(html: str) -> list[str]:
                     found.append(email)
                 elif isinstance(email, list):
                     found.extend(str(e) for e in email)
-                for v in node.values():
-                    if isinstance(v, (dict, list)):
-                        stack.append(v)
+                for value in node.values():
+                    if isinstance(value, (dict, list)):
+                        stack.append(value)
             elif isinstance(node, list):
                 stack.extend(node)
     return found
@@ -125,28 +198,360 @@ def extract_emails_from_html(html: str) -> list[str]:
     """Collect normalized emails from HTML, best-first order."""
     candidates: list[str] = []
 
-    for m in _MAILTO_RE.findall(html):
-        candidates.append(m)
-    for m in _DATA_EMAIL_RE.findall(html):
-        candidates.append(m)
-    for m in _ITEMPROP_EMAIL_RE.findall(html):
-        candidates.append(m)
-    for m in _META_EMAIL_RE.findall(html):
-        candidates.append(m)
+    candidates.extend(_MAILTO_RE.findall(html))
+    candidates.extend(_DATA_EMAIL_RE.findall(html))
+    candidates.extend(_ITEMPROP_EMAIL_RE.findall(html))
+    candidates.extend(_META_EMAIL_RE.findall(html))
     candidates.extend(_emails_from_json_ld(html))
-    for m in _EMAIL_RE.findall(html[:120_000]):
-        candidates.append(m)
+    candidates.extend(_email_candidates(html[:160_000]))
 
     seen: set[str] = set()
     ordered: list[str] = []
     for raw in candidates:
-        norm = _normalize_email(raw)
-        if norm and norm not in seen:
-            seen.add(norm)
-            ordered.append(norm)
+        normalized = _normalize_email(raw)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            ordered.append(normalized)
     return ordered
 
 
 def extract_primary_email(html: str) -> str | None:
     emails = extract_emails_from_html(html)
     return emails[0] if emails else None
+
+
+@dataclass
+class _HtmlNode:
+    tag: str
+    attrs: dict[str, str]
+    parent: "_HtmlNode | None" = None
+    children: list["_HtmlNode"] = field(default_factory=list)
+    text_parts: list[str] = field(default_factory=list)
+
+    def text(self) -> str:
+        values = [*self.text_parts]
+        for child in self.children:
+            values.append(child.text())
+        return _clean_text(" ".join(values))
+
+    def attr_text(self) -> str:
+        return " ".join(f"{key} {value}" for key, value in self.attrs.items())
+
+
+class _TreeParser(HTMLParser):
+    """Tolerant enough HTML tree for finding email-card context."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.root = _HtmlNode("document", {})
+        self.nodes: list[_HtmlNode] = [self.root]
+        self._stack: list[_HtmlNode] = [self.root]
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        node = _HtmlNode(tag.lower(), {key.lower(): value or "" for key, value in attrs}, self._stack[-1])
+        self._stack[-1].children.append(node)
+        self.nodes.append(node)
+        if node.tag not in _VOID_TAGS:
+            self._stack.append(node)
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.handle_starttag(tag, attrs)
+        if tag.lower() not in _VOID_TAGS:
+            self.handle_endtag(tag)
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        for position in range(len(self._stack) - 1, 0, -1):
+            if self._stack[position].tag == tag:
+                del self._stack[position:]
+                break
+
+    def handle_data(self, data: str) -> None:
+        if data:
+            self._stack[-1].text_parts.append(data)
+
+
+def _clean_text(value: str) -> str:
+    return re.sub(r"\s+", " ", unescape(value or "")).strip()
+
+
+def _node_and_ancestors(node: _HtmlNode) -> list[_HtmlNode]:
+    result: list[_HtmlNode] = []
+    current: _HtmlNode | None = node
+    while current is not None:
+        result.append(current)
+        current = current.parent
+    return result
+
+
+def _is_person_container(node: _HtmlNode) -> bool:
+    return bool(_PERSON_CONTAINER_RE.search(node.attr_text()))
+
+
+def _context_node(node: _HtmlNode) -> tuple[_HtmlNode, bool]:
+    """Prefer a card-like staff container; otherwise retain a small local parent."""
+    ancestors = _node_and_ancestors(node)
+    for candidate in ancestors:
+        if _is_person_container(candidate) and len(candidate.text()) <= 2_000:
+            return candidate, True
+    for candidate in ancestors[1:4]:
+        if candidate.tag in {"li", "article", "address", "p", "div", "section"} and len(candidate.text()) <= 700:
+            return candidate, False
+    return node, False
+
+
+def _descendants(node: _HtmlNode) -> list[_HtmlNode]:
+    output: list[_HtmlNode] = []
+    stack = list(reversed(node.children))
+    while stack:
+        child = stack.pop()
+        output.append(child)
+        stack.extend(reversed(child.children))
+    return output
+
+
+def _probably_name(value: str) -> str:
+    text = _clean_text(value)
+    text = re.sub(r"\b(?:email|contact|call|phone|tel)\b.*$", "", text, flags=re.I).strip(" -|:")
+    if not text or "@" in text or len(text) > 90 or re.search(r"\d{3,}", text):
+        return ""
+    words = text.split()
+    if not 2 <= len(words) <= 6:
+        return ""
+    if any(word.lower() in {"contact", "email", "sales", "service", "department", "team", "staff"} for word in words):
+        return ""
+    if not any(any(ch.isalpha() for ch in word) for word in words):
+        return ""
+    return text
+
+
+def _probably_role(value: str) -> str:
+    text = _clean_text(value).strip(" -|:")
+    if not text or "@" in text or len(text) > 120 or re.search(r"\d{4,}", text):
+        return ""
+    if re.search(r"\b(?:email|contact|call|phone|tel|directions)\b", text, re.I):
+        return ""
+    return text
+
+
+def _staff_metadata(node: _HtmlNode) -> tuple[str, str]:
+    """Infer a card's name and role from semantic attributes/headings."""
+    context, is_person_card = _context_node(node)
+    candidates = [context, *_descendants(context)]
+    name = ""
+    role = ""
+    headings: list[str] = []
+    for candidate in candidates:
+        text = candidate.text()
+        attrs = candidate.attr_text()
+        if not name and (
+            candidate.tag in {"h1", "h2", "h3", "h4", "h5", "h6", "strong", "b"}
+            or _NAME_HINT_RE.search(attrs)
+            or candidate.attrs.get("itemprop", "").lower() == "name"
+        ):
+            name = _probably_name(text)
+        if not role and (
+            _ROLE_HINT_RE.search(attrs)
+            or candidate.attrs.get("itemprop", "").lower() in {"jobtitle", "role"}
+        ):
+            role = _probably_role(text)
+        if candidate.tag in {"h1", "h2", "h3", "h4", "h5", "h6", "strong", "b"}:
+            heading = _clean_text(text)
+            if heading and len(heading) <= 120:
+                headings.append(heading)
+
+    # Many cards use an unlabelled H3 for a name followed by a short paragraph
+    # for the title. Do this only when the surrounding element looks like staff.
+    if is_person_card and not name:
+        for heading in headings:
+            name = _probably_name(heading)
+            if name:
+                break
+    if is_person_card and not role and name:
+        for candidate in _descendants(context):
+            if candidate.tag not in {"p", "span", "div", "small"}:
+                continue
+            possible = _probably_role(candidate.text())
+            if possible and possible != name:
+                role = possible
+                break
+    if is_person_card and not role and name:
+        full_text = context.text()
+        remainder = _clean_text(full_text.replace(name, "", 1))
+        for part in re.split(r"[|•\n]", remainder):
+            possible = _probably_role(part)
+            if possible and possible != name:
+                role = possible
+                break
+    return name, role
+
+
+def _json_ld_staff_records(html: str, source_url: str) -> list[dict[str, str]]:
+    records: list[dict[str, str]] = []
+    for block in _JSON_LD_RE.findall(html):
+        try:
+            data = json.loads(unescape(block.strip()))
+        except json.JSONDecodeError:
+            continue
+        stack = data if isinstance(data, list) else [data]
+        while stack:
+            node = stack.pop()
+            if isinstance(node, dict):
+                raw_email = node.get("email")
+                types = node.get("@type", "")
+                type_values = types if isinstance(types, list) else [types]
+                looks_like_person = any(str(value).lower() == "person" for value in type_values)
+                if raw_email:
+                    emails = raw_email if isinstance(raw_email, list) else [raw_email]
+                    for raw in emails:
+                        email = _normalize_email(str(raw))
+                        if email:
+                            records.append(
+                                {
+                                    "email": email,
+                                    "name": _clean_text(str(node.get("name", ""))) if looks_like_person else "",
+                                    "role": _clean_text(str(node.get("jobTitle") or node.get("role") or "")) if looks_like_person else "",
+                                    "source_url": source_url,
+                                }
+                            )
+                for value in node.values():
+                    if isinstance(value, (dict, list)):
+                        stack.append(value)
+            elif isinstance(node, list):
+                stack.extend(node)
+    return records
+
+
+def _merge_staff_records(records: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Deduplicate by email while retaining the richest discovered context."""
+    by_email: dict[str, dict[str, str]] = {}
+    order: list[str] = []
+    for raw in records:
+        email = _normalize_email(raw.get("email", ""))
+        if not email:
+            continue
+        record = {
+            "email": email,
+            "name": _clean_text(raw.get("name", "")),
+            "role": _clean_text(raw.get("role", "")),
+            "source_url": raw.get("source_url", ""),
+        }
+        existing = by_email.get(email)
+        if existing is None:
+            by_email[email] = record
+            order.append(email)
+            continue
+        # A named record on a team page is more valuable than the same mailbox
+        # found in a global site footer.
+        added_person_context = False
+        for field in ("name", "role"):
+            if not existing[field] and record[field]:
+                existing[field] = record[field]
+                added_person_context = True
+        if added_person_context and record["source_url"]:
+            existing["source_url"] = record["source_url"]
+        elif not existing["source_url"] and record["source_url"]:
+            existing["source_url"] = record["source_url"]
+    return [by_email[email] for email in order]
+
+
+def merge_staff_email_records(records: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Merge staff-email records from multiple dealer pages by email address."""
+    return _merge_staff_records(records)
+
+
+def extract_staff_email_records(html: str, source_url: str = "") -> list[dict[str, str]]:
+    """Return records with public email, inferred name/role, and source URL.
+
+    The function intentionally keeps public department or contact mailboxes too:
+    a dealer may expose no individual names, but those addresses are still useful
+    contacts and can be revisited later as pages change.
+    """
+    parser = _TreeParser()
+    try:
+        parser.feed(html or "")
+        parser.close()
+    except Exception:
+        # HTMLParser is very forgiving; this simply preserves regex extraction
+        # if a malformed response still manages to upset it.
+        pass
+
+    records = _json_ld_staff_records(html, source_url)
+    represented: set[str] = set()
+    for node in parser.nodes:
+        candidates: list[str] = []
+        for key, value in node.attrs.items():
+            if key in {"href", "data-email", "data-e-mail", "data-mail", "data-cfemail"}:
+                if key == "data-cfemail":
+                    decoded = _decode_cloudflare_email(value)
+                    if decoded:
+                        candidates.append(decoded)
+                else:
+                    candidates.extend(_email_candidates(value))
+                    if key == "href" and value.lower().startswith("mailto:"):
+                        candidates.append(value)
+        candidates.extend(_email_candidates(" ".join(node.text_parts)))
+        if not candidates:
+            continue
+        name, role = _staff_metadata(node)
+        for raw in candidates:
+            email = _normalize_email(raw)
+            if email:
+                represented.add(email)
+                records.append({"email": email, "name": name, "role": role, "source_url": source_url})
+
+    # Include addresses in scripts/JSON and unusual markup that do not map to a
+    # text node. The earlier node pass normally gives better person context.
+    for email in extract_emails_from_html(html):
+        if email not in represented:
+            records.append({"email": email, "name": "", "role": "", "source_url": source_url})
+    return _merge_staff_records(records)
+
+
+def _site_host(url: str) -> str:
+    return urlparse(url).netloc.lower().split(":", 1)[0].removeprefix("www.")
+
+
+def find_staff_page_urls(html: str, base_url: str, *, limit: int = 8) -> list[str]:
+    """Find same-site contact, staff, team, and leadership pages from a home page.
+
+    Links are ranked rather than relying on one exact URL naming convention.
+    The bounded result avoids turning a dealer enrichment into an uncontrolled
+    crawl while still covering common `contact`, `meet-the-team`, `staff`, and
+    `directory` structures.
+    """
+    if limit <= 0:
+        return []
+    base_host = _site_host(base_url)
+    scored: dict[str, int] = {}
+    for match in re.finditer(r"<a\b([^>]*?)>(.*?)</a\s*>", html or "", re.I | re.S):
+        attributes, inner = match.groups()
+        href_match = re.search(r"\bhref\s*=\s*['\"]([^'\"]+)", attributes, re.I)
+        if not href_match:
+            continue
+        href = unescape(href_match.group(1)).strip()
+        if not href or href.startswith(("#", "mailto:", "tel:", "javascript:")):
+            continue
+        absolute, _ = urldefrag(urljoin(base_url, href))
+        parsed = urlparse(absolute)
+        if parsed.scheme not in {"http", "https"} or _site_host(absolute) != base_host:
+            continue
+        if _NON_PAGE_SUFFIX_RE.search(absolute):
+            continue
+        label = _clean_text(re.sub(r"<[^>]+>", " ", inner))
+        attributes_text = _clean_text(re.sub(r"\s+", " ", attributes))
+        haystack = f"{parsed.path} {parsed.query} {label} {attributes_text}".lower()
+        if not _STAFF_LINK_RE.search(haystack):
+            continue
+        score = 0
+        if re.search(r"staff|team|meet|leadership|management|directory|people|employee|associate", haystack, re.I):
+            score += 4
+        if re.search(r"contact", haystack, re.I):
+            score += 3
+        if re.search(r"about|who.we.are", haystack, re.I):
+            score += 1
+        if label:
+            score += 1
+        canonical = parsed._replace(fragment="").geturl()
+        scored[canonical] = max(scored.get(canonical, 0), score)
+    return [url for url, _ in sorted(scored.items(), key=lambda item: (-item[1], item[0]))[:limit]]

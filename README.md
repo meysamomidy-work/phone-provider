@@ -7,6 +7,33 @@ email, chat, dealer-type, 360° viewer, and customer-AI fields.
 python enrich_dealers.py ..\google-maps\enriched_new -t 6 --fetch-mode auto
 ```
 
+## Staff-email-only enrichment
+
+To extend an existing dealer file with public contact/staff emails without
+running the other enrichers, use `--staff-emails-only`. The source file is
+never edited: the result is written to `enriched_v6/` by default (or to `-o`).
+All source columns are retained exactly and one append-only `Staff Emails`
+column is added.
+
+```powershell
+python enrich_dealers.py ..\google-maps\enriched_new\dealers.csv `
+  --staff-emails-only -t 2 --fetch-mode auto
+```
+
+`Staff Emails` is compact JSON so CSV and Excel consumers retain the person
+context together, for example:
+
+```json
+[{"email":"jordan@dealer.com","name":"Jordan Lee","role":"General Manager","source_url":"https://dealer.com/meet-our-team"}]
+```
+
+The pass scans the homepage, then follows up to eight same-site links ranked
+as contact, staff, team, leadership, management, people, or directory pages.
+It extracts normal `mailto:` links, visible text, structured JSON-LD, common
+`[at]`/`[dot]` obfuscation, and Cloudflare's public email obfuscation. Set
+`--staff-page-limit N` to tune that bounded scan; populated `Staff Emails`
+cells are left unchanged on later runs.
+
 For a broader pass over integrations that are injected by JavaScript or only
 exist on a vehicle-detail page, use deep detection. It opens a browser for the
 home page, captures loaded script/frame/API URLs, and samples up to three
