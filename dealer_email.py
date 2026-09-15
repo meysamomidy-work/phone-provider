@@ -16,22 +16,9 @@ from html import unescape
 from html.parser import HTMLParser
 from urllib.parse import unquote, urldefrag, urljoin, urlparse
 
-_MAILTO_RE = re.compile(r"href\s*=\s*['\"]mailto:([^'\"?]+)", re.I)
 _JSON_LD_RE = re.compile(
     r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
     re.I | re.S,
-)
-_DATA_EMAIL_RE = re.compile(
-    r'data-(?:email|e-mail|mail)\s*=\s*["\']([^"\']+)["\']',
-    re.I,
-)
-_ITEMPROP_EMAIL_RE = re.compile(
-    r'itemprop=["\']email["\'][^>]*>([^<]+)<',
-    re.I,
-)
-_META_EMAIL_RE = re.compile(
-    r'<meta[^>]+(?:name|property)=["\'](?:og:email|email)["\'][^>]+content=["\']([^"\']+)["\']',
-    re.I,
 )
 _EMAIL_RE = re.compile(
     r"\b([a-zA-Z0-9][a-zA-Z0-9._%+-]*@[a-zA-Z0-9][a-zA-Z0-9.-]*\.[a-zA-Z]{2,})\b"
@@ -51,6 +38,7 @@ _PERSON_CONTAINER_RE = re.compile(
     r"leadership|management|manager|director|salesperson|sales-rep|representative)",
     re.I,
 )
+_PERSON_ACTION_RE = re.compile(r"(?:action|button|email|contact|social|share|modal|link)", re.I)
 # Do not treat a whole ``staff-card`` / ``team-member`` container as a name;
 # the name normally lives in a descendant heading or a more specific *-name
 # element.  Broad person-card labels are handled by the heading fallback.
@@ -65,6 +53,9 @@ _STAFF_LINK_RE = re.compile(
     re.I,
 )
 _NON_PAGE_SUFFIX_RE = re.compile(r"\.(?:pdf|jpg|jpeg|png|gif|webp|svg|zip|mp4|css|js)(?:$|[?#])", re.I)
+_NON_VISIBLE_EMAIL_TAGS = frozenset({"script", "style", "template", "noscript", "svg", "code", "pre"})
+_HEADING_TAGS = frozenset({"h1", "h2", "h3", "h4", "h5", "h6", "strong", "b"})
+_BUSINESS_SCHEMA_TYPES = frozenset({"organization", "localbusiness", "autodealer", "automotivebusiness", "contactpoint"})
 
 _INVALID_LOCAL_PARTS = frozenset(
     {
@@ -195,15 +186,15 @@ def _emails_from_json_ld(html: str) -> list[str]:
 
 
 def extract_emails_from_html(html: str) -> list[str]:
-    """Collect normalized emails from HTML, best-first order."""
+    """Collect normalized public emails, excluding script/build-package text."""
+    dom_candidates = _visible_dom_email_candidates(html)
     candidates: list[str] = []
-
-    candidates.extend(_MAILTO_RE.findall(html))
-    candidates.extend(_DATA_EMAIL_RE.findall(html))
-    candidates.extend(_ITEMPROP_EMAIL_RE.findall(html))
-    candidates.extend(_META_EMAIL_RE.findall(html))
+    candidates.extend(dom_candidates["mailto"])
+    candidates.extend(dom_candidates["data"])
+    candidates.extend(dom_candidates["itemprop"])
+    candidates.extend(dom_candidates["meta"])
     candidates.extend(_emails_from_json_ld(html))
-    candidates.extend(_email_candidates(html[:160_000]))
+    candidates.extend(dom_candidates["text"])
 
     seen: set[str] = set()
     ordered: list[str] = []
@@ -285,17 +276,87 @@ def _node_and_ancestors(node: _HtmlNode) -> list[_HtmlNode]:
 
 
 def _is_person_container(node: _HtmlNode) -> bool:
-    return bool(_PERSON_CONTAINER_RE.search(node.attr_text()))
+    attributes = node.attr_text()
+    return bool(_PERSON_CONTAINER_RE.search(attributes)) and not bool(_PERSON_ACTION_RE.search(attributes))
+
+
+def _has_non_visible_ancestor(node: _HtmlNode) -> bool:
+    return any(candidate.tag in _NON_VISIBLE_EMAIL_TAGS for candidate in _node_and_ancestors(node))
+
+
+def _visible_node_text(node: _HtmlNode) -> str:
+    """Text rendered to a visitor, without script/template/style descendants."""
+    if node.tag in _NON_VISIBLE_EMAIL_TAGS:
+        return ""
+    values = [*node.text_parts]
+    for child in node.children:
+        values.append(_visible_node_text(child))
+    return _clean_text(" ".join(values))
+
+
+def _visible_dom_email_candidates(html: str) -> dict[str, list[str]]:
+    """Read actual DOM attributes/visible text, never raw JavaScript bundles."""
+    result = {"mailto": [], "data": [], "itemprop": [], "meta": [], "text": []}
+    parser = _TreeParser()
+    try:
+        parser.feed(html or "")
+        parser.close()
+    except Exception:
+        return result
+
+    for node in parser.nodes:
+        if _has_non_visible_ancestor(node):
+            continue
+        href = node.attrs.get("href", "")
+        if href.lower().startswith("mailto:"):
+            result["mailto"].append(href)
+        for key in ("data-email", "data-e-mail", "data-mail"):
+            if value := node.attrs.get(key):
+                result["data"].extend(_email_candidates(value))
+        if encoded := node.attrs.get("data-cfemail"):
+            decoded = _decode_cloudflare_email(encoded)
+            if decoded:
+                result["data"].append(decoded)
+        if node.attrs.get("itemprop", "").lower() == "email":
+            result["itemprop"].extend(_email_candidates(_visible_node_text(node)))
+        if node.tag == "meta" and node.attrs.get("name", node.attrs.get("property", "")).lower() in {"og:email", "email"}:
+            result["meta"].extend(_email_candidates(node.attrs.get("content", "")))
+        result["text"].extend(_email_candidates(" ".join(node.text_parts)))
+        if node.tag in {"a", "p", "span", "div", "li", "article", "address", "section"}:
+            node_text = _visible_node_text(node)
+            if len(node_text) <= 2_000:
+                result["text"].extend(_email_candidates(node_text))
+    return result
 
 
 def _context_node(node: _HtmlNode) -> tuple[_HtmlNode, bool]:
-    """Prefer a card-like staff container; otherwise retain a small local parent."""
+    """Choose the closest small card that actually contains staff-like markup."""
     ancestors = _node_and_ancestors(node)
-    for candidate in ancestors:
-        if _is_person_container(candidate) and len(candidate.text()) <= 2_000:
-            return candidate, True
+    best: tuple[int, _HtmlNode, bool] | None = None
+    for position, candidate in enumerate(ancestors[1:], start=1):
+        if candidate.tag == "document":
+            continue
+        text_length = len(_visible_node_text(candidate))
+        is_person = _is_person_container(candidate)
+        max_length = 2_000 if is_person else 700
+        if text_length > max_length:
+            continue
+        has_heading = any(child.tag in _HEADING_TAGS for child in _descendants(candidate))
+        if not (is_person or has_heading):
+            continue
+        # A normal <li>/<article> with H3/H4 staff data is a valid card even
+        # when a CMS gives it a generic class.  This is the markup used by
+        # Dealer Inspire (including Kendall Toyota of Anchorage).
+        score = 20 if is_person else 0
+        score += 8 if has_heading else 0
+        score += 3 if candidate.tag in {"li", "article", "address"} else 1
+        score += max(0, 4 - position)  # prefer the nearest qualifying card
+        if best is None or score > best[0]:
+            best = (score, candidate, is_person or has_heading)
+    if best is not None:
+        return best[1], best[2]
     for candidate in ancestors[1:4]:
-        if candidate.tag in {"li", "article", "address", "p", "div", "section"} and len(candidate.text()) <= 700:
+        if candidate.tag in {"li", "article", "address", "p", "div", "section"} and len(_visible_node_text(candidate)) <= 700:
             return candidate, False
     return node, False
 
@@ -329,43 +390,73 @@ def _probably_role(value: str) -> str:
     text = _clean_text(value).strip(" -|:")
     if not text or "@" in text or len(text) > 120 or re.search(r"\d{4,}", text):
         return ""
-    if re.search(r"\b(?:email|contact|call|phone|tel|directions)\b", text, re.I):
+    if re.search(r"\b(?:email|contact|phone|tel|directions)\b", text, re.I):
         return ""
     return text
+
+
+def _has_role_hint(node: _HtmlNode) -> bool:
+    """Recognize role/title fields without mistaking ARIA ``role`` for a job."""
+    attributes = " ".join(
+        f"{key} {value}"
+        for key, value in node.attrs.items()
+        if key != "role"
+    )
+    return bool(_ROLE_HINT_RE.search(attributes))
 
 
 def _staff_metadata(node: _HtmlNode) -> tuple[str, str]:
     """Infer a card's name and role from semantic attributes/headings."""
     context, is_person_card = _context_node(node)
     candidates = [context, *_descendants(context)]
-    name = ""
-    role = ""
-    headings: list[str] = []
+    name = _probably_name(
+        node.attrs.get("data-staff-name")
+        or node.attrs.get("data-employee-name")
+        or node.attrs.get("data-person-name")
+        or ""
+    )
+    role = _probably_role(
+        node.attrs.get("data-staff-title")
+        or node.attrs.get("data-job-title")
+        or node.attrs.get("data-position")
+        or ""
+    )
+    headings: list[tuple[str, str]] = []
     for candidate in candidates:
-        text = candidate.text()
+        text = _visible_node_text(candidate)
         attrs = candidate.attr_text()
         if not name and (
-            candidate.tag in {"h1", "h2", "h3", "h4", "h5", "h6", "strong", "b"}
+            candidate.tag in _HEADING_TAGS
             or _NAME_HINT_RE.search(attrs)
             or candidate.attrs.get("itemprop", "").lower() == "name"
         ):
             name = _probably_name(text)
         if not role and (
-            _ROLE_HINT_RE.search(attrs)
+            _has_role_hint(candidate)
             or candidate.attrs.get("itemprop", "").lower() in {"jobtitle", "role"}
         ):
             role = _probably_role(text)
-        if candidate.tag in {"h1", "h2", "h3", "h4", "h5", "h6", "strong", "b"}:
+        if candidate.tag in _HEADING_TAGS:
             heading = _clean_text(text)
             if heading and len(heading) <= 120:
-                headings.append(heading)
+                headings.append((candidate.tag, heading))
 
     # Many cards use an unlabelled H3 for a name followed by a short paragraph
     # for the title. Do this only when the surrounding element looks like staff.
     if is_person_card and not name:
-        for heading in headings:
+        for _, heading in headings:
             name = _probably_name(heading)
             if name:
+                break
+    # Some dealer platforms use an H3 followed by an H4 rather than classes
+    # such as `job-title`; use the following heading as the role.
+    if is_person_card and not role and name:
+        for tag, heading in headings:
+            if tag in {"strong", "b"} or heading == name:
+                continue
+            possible = _probably_role(heading)
+            if possible:
+                role = possible
                 break
     if is_person_card and not role and name:
         for candidate in _descendants(context):
@@ -376,7 +467,7 @@ def _staff_metadata(node: _HtmlNode) -> tuple[str, str]:
                 role = possible
                 break
     if is_person_card and not role and name:
-        full_text = context.text()
+        full_text = _visible_node_text(context)
         remainder = _clean_text(full_text.replace(name, "", 1))
         for part in re.split(r"[|•\n]", remainder):
             possible = _probably_role(part)
@@ -386,7 +477,7 @@ def _staff_metadata(node: _HtmlNode) -> tuple[str, str]:
     return name, role
 
 
-def _json_ld_staff_records(html: str, source_url: str) -> list[dict[str, str]]:
+def _json_ld_staff_records(html: str) -> list[dict[str, str]]:
     records: list[dict[str, str]] = []
     for block in _JSON_LD_RE.findall(html):
         try:
@@ -400,8 +491,10 @@ def _json_ld_staff_records(html: str, source_url: str) -> list[dict[str, str]]:
                 raw_email = node.get("email")
                 types = node.get("@type", "")
                 type_values = types if isinstance(types, list) else [types]
-                looks_like_person = any(str(value).lower() == "person" for value in type_values)
-                if raw_email:
+                schema_types = {str(value).replace(" ", "").lower() for value in type_values}
+                looks_like_person = "person" in schema_types
+                is_business_contact = bool(schema_types & _BUSINESS_SCHEMA_TYPES)
+                if raw_email and (looks_like_person or is_business_contact):
                     emails = raw_email if isinstance(raw_email, list) else [raw_email]
                     for raw in emails:
                         email = _normalize_email(str(raw))
@@ -411,7 +504,6 @@ def _json_ld_staff_records(html: str, source_url: str) -> list[dict[str, str]]:
                                     "email": email,
                                     "name": _clean_text(str(node.get("name", ""))) if looks_like_person else "",
                                     "role": _clean_text(str(node.get("jobTitle") or node.get("role") or "")) if looks_like_person else "",
-                                    "source_url": source_url,
                                 }
                             )
                 for value in node.values():
@@ -434,7 +526,6 @@ def _merge_staff_records(records: list[dict[str, str]]) -> list[dict[str, str]]:
             "email": email,
             "name": _clean_text(raw.get("name", "")),
             "role": _clean_text(raw.get("role", "")),
-            "source_url": raw.get("source_url", ""),
         }
         existing = by_email.get(email)
         if existing is None:
@@ -443,15 +534,9 @@ def _merge_staff_records(records: list[dict[str, str]]) -> list[dict[str, str]]:
             continue
         # A named record on a team page is more valuable than the same mailbox
         # found in a global site footer.
-        added_person_context = False
         for field in ("name", "role"):
             if not existing[field] and record[field]:
                 existing[field] = record[field]
-                added_person_context = True
-        if added_person_context and record["source_url"]:
-            existing["source_url"] = record["source_url"]
-        elif not existing["source_url"] and record["source_url"]:
-            existing["source_url"] = record["source_url"]
     return [by_email[email] for email in order]
 
 
@@ -460,8 +545,8 @@ def merge_staff_email_records(records: list[dict[str, str]]) -> list[dict[str, s
     return _merge_staff_records(records)
 
 
-def extract_staff_email_records(html: str, source_url: str = "") -> list[dict[str, str]]:
-    """Return records with public email, inferred name/role, and source URL.
+def extract_staff_email_records(html: str) -> list[dict[str, str]]:
+    """Return public email records with inferred name and role.
 
     The function intentionally keeps public department or contact mailboxes too:
     a dealer may expose no individual names, but those addresses are still useful
@@ -476,35 +561,38 @@ def extract_staff_email_records(html: str, source_url: str = "") -> list[dict[st
         # if a malformed response still manages to upset it.
         pass
 
-    records = _json_ld_staff_records(html, source_url)
-    represented: set[str] = set()
+    records = _json_ld_staff_records(html)
     for node in parser.nodes:
+        # Bundled React code, vendor scripts, source maps, and style/template
+        # data routinely contain example/support addresses. They are not
+        # dealer contacts, so only rendered markup contributes here. JSON-LD
+        # Person/business records are handled separately above.
+        if _has_non_visible_ancestor(node):
+            continue
         candidates: list[str] = []
         for key, value in node.attrs.items():
-            if key in {"href", "data-email", "data-e-mail", "data-mail", "data-cfemail"}:
+            if key in {"data-email", "data-e-mail", "data-mail", "data-cfemail"}:
                 if key == "data-cfemail":
                     decoded = _decode_cloudflare_email(value)
                     if decoded:
                         candidates.append(decoded)
                 else:
                     candidates.extend(_email_candidates(value))
-                    if key == "href" and value.lower().startswith("mailto:"):
-                        candidates.append(value)
+            elif key == "href" and value.lower().startswith("mailto:"):
+                candidates.append(value)
         candidates.extend(_email_candidates(" ".join(node.text_parts)))
+        # This also captures visible addresses split by nested <span> tags.
+        if node.tag in {"a", "p", "span", "div", "li", "article", "address", "section"}:
+            node_text = _visible_node_text(node)
+            if len(node_text) <= 2_000:
+                candidates.extend(_email_candidates(node_text))
         if not candidates:
             continue
         name, role = _staff_metadata(node)
         for raw in candidates:
             email = _normalize_email(raw)
             if email:
-                represented.add(email)
-                records.append({"email": email, "name": name, "role": role, "source_url": source_url})
-
-    # Include addresses in scripts/JSON and unusual markup that do not map to a
-    # text node. The earlier node pass normally gives better person context.
-    for email in extract_emails_from_html(html):
-        if email not in represented:
-            records.append({"email": email, "name": "", "role": "", "source_url": source_url})
+                records.append({"email": email, "name": name, "role": role})
     return _merge_staff_records(records)
 
 

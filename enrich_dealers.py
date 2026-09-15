@@ -812,6 +812,31 @@ def _staff_email_column(df: pd.DataFrame) -> str:
     return OUTPUT_STAFF_EMAILS_COL
 
 
+def _without_staff_source_urls(value: str) -> str:
+    """Remove the retired ``source_url`` field from prior staff-email outputs."""
+    try:
+        parsed = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return value
+
+    changed = False
+    if isinstance(parsed, list):
+        cleaned: list[Any] = []
+        for entry in parsed:
+            if isinstance(entry, dict) and "source_url" in entry:
+                cleaned.append({key: item for key, item in entry.items() if key != "source_url"})
+                changed = True
+            else:
+                cleaned.append(entry)
+        parsed = cleaned
+    elif isinstance(parsed, dict) and "source_url" in parsed:
+        parsed = {key: item for key, item in parsed.items() if key != "source_url"}
+        changed = True
+    if not changed:
+        return value
+    return json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+
+
 def _staff_output_columns(df: pd.DataFrame, staff_email_col: str) -> list[str]:
     """Preserve every source column; the staff JSON field is append-only."""
     columns = list(df.columns)
@@ -864,7 +889,7 @@ def _collect_staff_records(
         return [], False, 0
 
     homepage_url, homepage_html = homepage
-    records = extract_staff_email_records(homepage_html, homepage_url)
+    records = extract_staff_email_records(homepage_html)
     pages_scanned = 1
     seen_urls = {homepage_url.rstrip("/")}
     for page_url in find_staff_page_urls(homepage_html, homepage_url, limit=page_limit):
@@ -888,7 +913,7 @@ def _collect_staff_records(
             continue
         final_url, page_html = fetched
         pages_scanned += 1
-        records.extend(extract_staff_email_records(page_html, final_url))
+        records.extend(extract_staff_email_records(page_html))
     return merge_staff_email_records(records), True, pages_scanned
 
 
@@ -959,8 +984,10 @@ def enrich_staff_emails_file(
         )
         if _has_enrichment_value(existing):
             # This includes []: an earlier run intentionally found no public
-            # emails, and reruns must not replace a supplied value.
-            results[idx] = existing
+            # emails, and reruns do not rescan or replace supplied values.
+            # The one safe normalization is stripping source_url, a retired
+            # field that must no longer appear in Staff Emails JSON.
+            results[idx] = _without_staff_source_urls(existing)
             already_present += 1
             continue
         url = normalize_dealer_url(str(value) if pd.notna(value) else "")

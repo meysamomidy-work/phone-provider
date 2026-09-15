@@ -24,15 +24,16 @@ python enrich_dealers.py ..\google-maps\enriched_new\dealers.csv `
 context together, for example:
 
 ```json
-[{"email":"jordan@dealer.com","name":"Jordan Lee","role":"General Manager","source_url":"https://dealer.com/meet-our-team"}]
+[{"email":"jordan@dealer.com","name":"Jordan Lee","role":"General Manager"}]
 ```
 
 The pass scans the homepage, then follows up to eight same-site links ranked
 as contact, staff, team, leadership, management, people, or directory pages.
 It extracts normal `mailto:` links, visible text, structured JSON-LD, common
 `[at]`/`[dot]` obfuscation, and Cloudflare's public email obfuscation. Set
-`--staff-page-limit N` to tune that bounded scan; populated `Staff Emails`
-cells are left unchanged on later runs.
+`--staff-page-limit N` to tune that bounded scan. Existing records are not
+rescanned; running the pass again removes only legacy `source_url` keys from
+older `Staff Emails` JSON output.
 
 For a broader pass over integrations that are injected by JavaScript or only
 exist on a vehicle-detail page, use deep detection. It opens a browser for the

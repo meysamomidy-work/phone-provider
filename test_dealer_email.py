@@ -8,7 +8,7 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
-from dealer_email import extract_staff_email_records, find_staff_page_urls
+from dealer_email import extract_emails_from_html, extract_staff_email_records, find_staff_page_urls
 from enrich_dealers import enrich_staff_emails_file
 
 
@@ -22,13 +22,12 @@ class StaffEmailExtractionTests(unittest.TestCase):
         </section>
         """
         self.assertEqual(
-            extract_staff_email_records(html, "https://northstarauto.com/our-team"),
+            extract_staff_email_records(html),
             [
                 {
                     "email": "jordan.lee@northstarauto.com",
                     "name": "Jordan Lee",
                     "role": "General Manager",
-                    "source_url": "https://northstarauto.com/our-team",
                 }
             ],
         )
@@ -41,7 +40,7 @@ class StaffEmailExtractionTests(unittest.TestCase):
         </script>
         <p>Contact sales at sales [at] northstarauto [dot] com</p>
         """
-        records = extract_staff_email_records(html, "https://northstarauto.com/contact")
+        records = extract_staff_email_records(html)
         self.assertEqual([record["email"] for record in records], ["avery@northstarauto.com", "sales@northstarauto.com"])
         self.assertEqual(records[0]["name"], "Avery Kim")
         self.assertEqual(records[0]["role"], "Service Director")
@@ -54,9 +53,47 @@ class StaffEmailExtractionTests(unittest.TestCase):
           <a href="mailto:taylor@northstarauto.com">Contact</a>
         </div>
         """
-        record = extract_staff_email_records(html, "https://northstarauto.com/team")[0]
+        record = extract_staff_email_records(html)[0]
         self.assertEqual(record["name"], "Taylor Morgan")
         self.assertEqual(record["role"], "Finance Director")
+
+    def test_kendall_style_h3_h4_card_is_linked_to_email(self) -> None:
+        # Kendall Toyota of Anchorage presents each employee this way: a card
+        # with H3 name, H4 job title, and a following "Email Me" link.
+        html = """
+        <ul><li>
+          <img alt="Tim Toth" src="tim.jpg">
+          <h3>Tim Toth</h3><h4>General Manager</h4>
+          <div class="employee-actions"><a href="mailto:tim.toth@kendallauto.com">Email Me</a></div>
+        </li></ul>
+        """
+        self.assertEqual(
+            extract_staff_email_records(html),
+            [{"email": "tim.toth@kendallauto.com", "name": "Tim Toth", "role": "General Manager"}],
+        )
+
+    def test_job_title_with_call_is_not_rejected(self) -> None:
+        html = """
+        <li class="staff-item"><h3>Darlene Snow</h3><h4>Call Center Lead</h4>
+        <a href="mailto:darlenesnow@kendallauto.com">Email Me</a></li>
+        """
+        self.assertEqual(
+            extract_staff_email_records(html),
+            [{"email": "darlenesnow@kendallauto.com", "name": "Darlene Snow", "role": "Call Center Lead"}],
+        )
+
+    def test_script_and_template_emails_are_not_staff_contacts(self) -> None:
+        html = """
+        <script>const packageAuthor = "bootstrap@packages.example";</script>
+        <template>react-maintainer@packages.example</template>
+        <style>.x::after { content: "styles@packages.example"; }</style>
+        <p>Sales: <a href="mailto:sales@northstarauto.com">sales@northstarauto.com</a></p>
+        """
+        self.assertEqual(
+            extract_staff_email_records(html),
+            [{"email": "sales@northstarauto.com", "name": "", "role": ""}],
+        )
+        self.assertEqual(extract_emails_from_html(html), ["sales@northstarauto.com"])
 
     def test_staff_page_links_are_same_site_ranked_and_bounded(self) -> None:
         html = """
@@ -90,7 +127,6 @@ class StaffEmailOutputTests(unittest.TestCase):
                     "email": "jordan.lee@northstarauto.com",
                     "name": "Jordan Lee",
                     "role": "General Manager",
-                    "source_url": "https://northstarauto.com/our-team",
                 }
             ]
             with patch("enrich_dealers._collect_staff_records", return_value=(discovered, True, 2)) as scan:
@@ -117,6 +153,34 @@ class StaffEmailOutputTests(unittest.TestCase):
         self.assertEqual(rows[1]["Existing Value"], "also keep")
         self.assertEqual(rows[1]["Staff Emails"], "[]")
         self.assertNotIn("Website Provider", rows[0])
+
+    def test_existing_staff_json_is_migrated_without_a_rescan(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "dealers.csv"
+            output = Path(temp_dir) / "staff-emails.csv"
+            source.write_text(
+                "Dealer Name,Website,Staff Emails\n"
+                'Northstar Auto,https://northstarauto.com,"[{""email"":""jordan@northstarauto.com"",""name"":""Jordan Lee"",""source_url"":""https://northstarauto.com/team""}]"\n',
+                encoding="utf-8",
+            )
+            with patch("enrich_dealers._collect_staff_records") as scan:
+                enrich_staff_emails_file(
+                    source,
+                    output,
+                    website_col=None,
+                    state_col=None,
+                    threads=1,
+                    timeout=1,
+                    fetch_mode="http",
+                )
+            scan.assert_not_called()
+            with output.open(newline="", encoding="utf-8") as file:
+                row = next(csv.DictReader(file))
+
+        self.assertEqual(
+            json.loads(row["Staff Emails"]),
+            [{"email": "jordan@northstarauto.com", "name": "Jordan Lee"}],
+        )
 
 
 if __name__ == "__main__":
