@@ -8,7 +8,7 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
-from dealer_email import extract_emails_from_html, extract_staff_email_records, find_staff_page_urls
+from dealer_email import clean_staff_email_records, extract_emails_from_html, extract_staff_email_records, find_staff_page_urls, inspect_staff_page
 from enrich_dealers import _collect_staff_records, _enriched_output_root, _previous_website_email, enrich_staff_emails_file
 
 
@@ -122,6 +122,38 @@ class StaffEmailExtractionTests(unittest.TestCase):
             [{"email": "sales@northstarauto.com", "name": "", "role": ""}],
         )
 
+    def test_prior_false_positives_are_cleaned_without_losing_real_email(self) -> None:
+        source = json.dumps([
+            {"email": "info@ryanautomotive.com.you", "name": "We Welcome Your Feedback and Comments", "role": "Sales Hours"},
+            {"email": "info@ryanautomotive.com", "name": "We Welcome Your Feedback and Comments", "role": "Sales Hours"},
+            {"email": "price@northstarauto.com", "name": "Price LeBlanc", "role": "General Manager"},
+            {"email": "cvlasic@geauxautomotive.comâ�", "name": "Christian Vlasic", "role": "Sales Manager"},
+        ])
+        cleaned, removed, cleared = clean_staff_email_records(source)
+        self.assertEqual((removed, cleared), (2, 2))
+        self.assertEqual(json.loads(cleaned), [
+            {"email": "info@ryanautomotive.com", "name": "", "role": ""},
+            {"email": "price@northstarauto.com", "name": "Price LeBlanc", "role": "General Manager"},
+        ])
+        self.assertEqual(clean_staff_email_records('[{"email":"person@dealer.you"}]')[1], 0)
+
+    def test_page_signals_distinguish_staff_list_form_and_empty_listing(self) -> None:
+        self.assertEqual(
+            inspect_staff_page('<div class="staff-card"><h3>Jordan Lee</h3><h4>Manager</h4></div>').named_staff,
+            1,
+        )
+        self.assertTrue(inspect_staff_page('<h1>Meet Our Staff</h1><p>Currently there are no staff members listed.</p>').empty_listing)
+        self.assertTrue(inspect_staff_page('<form><input name="first_name"><input type="email" name="email"></form>').contact_form)
+        self.assertFalse(inspect_staff_page('<form><input type="email" name="newsletter_email"></form>').contact_form)
+        self.assertEqual(inspect_staff_page('<h1>Meet Our Staff</h1>').named_staff, 0)
+
+    def test_public_contact_email_is_kept_without_inventing_staff_name(self) -> None:
+        html = '<header>4219 Hwy 28 E | Pineville, LA • Lmpinevilleautosales@gmail.com</header><form><input name="email"></form>'
+        self.assertEqual(
+            extract_staff_email_records(html),
+            [{"email": "lmpinevilleautosales@gmail.com", "name": "", "role": ""}],
+        )
+
     def test_staff_page_links_are_same_site_ranked_and_bounded(self) -> None:
         html = """
         <a href="/contact-us">Contact Us</a>
@@ -224,6 +256,23 @@ class StaffEmailExtractionTests(unittest.TestCase):
         self.assertEqual(staff_count, 1)
         self.assertEqual({record["email"] for record in records}, {"jordan@northstarauto.com", "avery@northstarauto.com"})
 
+    def test_empty_http_page_gets_bounded_browser_retry(self) -> None:
+        site = "https://northstarauto.com/"
+        pages: list[dict[str, object]] = []
+        with patch("enrich_dealers.fetch_dealer_html", side_effect=[
+            (site, "<html><h1>Contact Us</h1></html>"),
+            (site, '<a href="mailto:sales@northstarauto.com">Email</a>'),
+        ]) as fetch:
+            records, loaded, count, _, _, _ = _collect_staff_records(
+                site, timeout=1, fetch_mode="auto", headed=False, page_limit=0, scan_pages=pages
+            )
+        self.assertTrue(loaded)
+        self.assertEqual(count, 2)
+        self.assertEqual(records[0]["email"], "sales@northstarauto.com")
+        self.assertEqual(fetch.call_count, 2)
+        self.assertEqual(fetch.call_args.kwargs["mode"], "browser")
+        self.assertTrue(pages[-1]["browser_retry"])
+
 
 class StaffEmailOutputTests(unittest.TestCase):
     def test_versioned_input_writes_to_next_version(self) -> None:
@@ -248,6 +297,7 @@ class StaffEmailOutputTests(unittest.TestCase):
                 if "loaded" in website:
                     return [], True, 2, 1, 0, ""
                 if "staff" in website:
+                    kwargs["scan_pages"].append({"result": "loaded", "named_staff": 1})
                     return [], True, 2, 0, 1, ""
                 return [], False, 0, 3, 0, ""
             with patch("enrich_dealers._collect_staff_records", side_effect=scan):
@@ -260,13 +310,37 @@ class StaffEmailOutputTests(unittest.TestCase):
         self.assertEqual(rows[0]["Staff Emails"], "[]")
         self.assertEqual(rows[0]["Staff Email Scan Status"], "No staff page reached")
         self.assertIn("No public email extracted from 2 loaded page(s)", rows[0]["Staff Email Scan Notes"])
-        self.assertIn("0 staff-like page(s) loaded", rows[0]["Staff Email Scan Notes"])
+        self.assertIn("0 staff-like URL(s) loaded", rows[0]["Staff Email Scan Notes"])
         self.assertIn("1 page fetch(es) failed", rows[0]["Staff Email Scan Notes"])
-        self.assertEqual(rows[1]["Staff Email Scan Status"], "No email on staff page")
-        self.assertIn("1 staff-like page(s) loaded", rows[1]["Staff Email Scan Notes"])
+        self.assertEqual(rows[1]["Staff Email Scan Status"], "Staff listed, no email")
+        self.assertIn("1 staff-like URL(s) loaded", rows[1]["Staff Email Scan Notes"])
         self.assertEqual(rows[2]["Staff Emails"], "[]")
         self.assertEqual(rows[2]["Staff Email Scan Status"], "Fetch failed")
         self.assertIn("could not be loaded", rows[2]["Staff Email Scan Notes"])
+
+    def test_page_evidence_classifies_empty_listing_and_contact_form(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "source.csv"
+            output = Path(temp_dir) / "output.csv"
+            source.write_text("Website,Staff Emails\nhttps://empty.example,[]\nhttps://form.example,[]\n", encoding="utf-8")
+            def scan(website: str, **kwargs: object) -> tuple[list[dict[str, str]], bool, int, int, int, str]:
+                kwargs["scan_pages"].append({
+                    "requested_url": website + "/staff",
+                    "final_url": website + "/staff",
+                    "result": "loaded",
+                    "emails": 0,
+                    "named_staff": 0,
+                    "empty_listing": "empty" in website,
+                    "contact_form": "form" in website,
+                })
+                return [], True, 2, 0, 1, ""
+            with patch("enrich_dealers._collect_staff_records", side_effect=scan):
+                enrich_staff_emails_file(source, output, website_col=None, state_col=None, threads=1, timeout=1, fetch_mode="http")
+            with output.open(newline="", encoding="utf-8") as file:
+                rows = list(csv.DictReader(file))
+        self.assertEqual(rows[0]["Staff Email Scan Status"], "Empty staff listing")
+        self.assertEqual(rows[1]["Staff Email Scan Status"], "Contact form only")
+        self.assertEqual(json.loads(rows[0]["Staff Email Scan Pages"])[0]["result"], "loaded")
 
     def test_empty_staff_array_is_rescanned_and_other_columns_preserved(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -290,7 +364,7 @@ class StaffEmailOutputTests(unittest.TestCase):
         self.assertEqual(row["Website Email"], "sales@northstarauto.com")
         self.assertEqual(row["Existing Value"], "keep me")
         self.assertEqual(row["Staff Email Scan Status"], "Found on site")
-        self.assertEqual(row["Staff Email Scan Notes"], "Found 1 email(s) on 2 loaded page(s). 1 staff-like page(s) loaded.")
+        self.assertEqual(row["Staff Email Scan Notes"], "Found 1 email(s) on 2 loaded page(s). 1 staff-like URL(s) loaded.")
 
     def test_prior_same_site_email_is_used_when_scan_found_none(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -348,7 +422,7 @@ class StaffEmailOutputTests(unittest.TestCase):
 
         self.assertEqual(
             list(rows[0]),
-            ["Process ID", "Dealer Name", "Website", "Existing Value", "Staff Emails", "Staff Email Scan Status", "Staff Email Scan Notes"],
+            ["Process ID", "Dealer Name", "Website", "Existing Value", "Staff Emails", "Staff Email Scan Status", "Staff Email Scan Notes", "Staff Email Scan Pages"],
         )
         self.assertEqual(rows[0]["Process ID"], "11")
         self.assertEqual(rows[0]["Existing Value"], "keep me")
@@ -357,6 +431,7 @@ class StaffEmailOutputTests(unittest.TestCase):
         self.assertEqual(rows[1]["Staff Emails"], "[]")
         self.assertEqual(rows[1]["Staff Email Scan Status"], "No website")
         self.assertEqual(rows[1]["Staff Email Scan Notes"], "No usable website URL.")
+        self.assertEqual(rows[1]["Staff Email Scan Pages"], "[]")
         self.assertNotIn("Website Provider", rows[0])
 
     def test_existing_staff_json_is_migrated_without_a_rescan(self) -> None:
@@ -388,6 +463,44 @@ class StaffEmailOutputTests(unittest.TestCase):
         )
         self.assertEqual(row["Staff Email Scan Notes"], "Existing staff emails retained; not rescanned.")
         self.assertEqual(row["Staff Email Scan Status"], "Previously found")
+
+    def test_prior_json_is_cleaned_without_changing_unrelated_columns(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "source.csv"
+            output = Path(temp_dir) / "output.csv"
+            with source.open("w", newline="", encoding="utf-8") as file:
+                writer = csv.writer(file)
+                writer.writerow(["Dealer Name", "Website", "Staff Emails", "Keep"])
+                writer.writerow(["Ryan Honda", "https://ryanautomotive.com", json.dumps([
+                    {"email": "info@ryanautomotive.com.you", "name": "We Welcome Your Feedback and Comments", "role": "Sales Hours"},
+                    {"email": "info@ryanautomotive.com", "name": "We Welcome Your Feedback and Comments", "role": "Sales Hours"},
+                ]), "unchanged"])
+            with patch("enrich_dealers._collect_staff_records") as scan:
+                enrich_staff_emails_file(source, output, website_col=None, state_col=None, threads=1, timeout=1, fetch_mode="http")
+            scan.assert_not_called()
+            with output.open(newline="", encoding="utf-8") as file:
+                row = next(csv.DictReader(file))
+        self.assertEqual(row["Keep"], "unchanged")
+        self.assertEqual(json.loads(row["Staff Emails"]), [{"email": "info@ryanautomotive.com", "name": "", "role": ""}])
+        self.assertIn("Cleaned 1 invalid/duplicate email(s) and 2 misleading metadata field(s)", row["Staff Email Scan Notes"])
+
+    def test_all_invalid_prior_records_are_retried(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "source.csv"
+            output = Path(temp_dir) / "output.csv"
+            with source.open("w", newline="", encoding="utf-8") as file:
+                writer = csv.writer(file)
+                writer.writerow(["Website", "Staff Emails", "Keep"])
+                writer.writerow(["https://northstarauto.com", json.dumps([{"email": "phone@318-639-9511.you"}]), "unchanged"])
+            discovered = [{"email": "sales@northstarauto.com", "name": "", "role": ""}]
+            with patch("enrich_dealers._collect_staff_records", return_value=(discovered, True, 1, 0, 0, "")) as scan:
+                enrich_staff_emails_file(source, output, website_col=None, state_col=None, threads=1, timeout=1, fetch_mode="http")
+            scan.assert_called_once()
+            with output.open(newline="", encoding="utf-8") as file:
+                row = next(csv.DictReader(file))
+        self.assertEqual(row["Keep"], "unchanged")
+        self.assertEqual(json.loads(row["Staff Emails"]), discovered)
+        self.assertIn("Cleaned 1 invalid/duplicate email(s)", row["Staff Email Scan Notes"])
 
 
 if __name__ == "__main__":

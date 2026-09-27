@@ -32,10 +32,12 @@ from dealer_chat_widget import detect_chat_widgets
 from dealer_360_imaging import detect_360_viewers
 from dealer_customer_ai import detect_customer_ai
 from dealer_email import (
+    clean_staff_email_records,
     extract_emails_from_html,
     extract_primary_email,
     extract_staff_email_records,
     find_staff_page_urls,
+    inspect_staff_page,
     merge_staff_email_records,
 )
 from dealer_phone import extract_primary_phone
@@ -92,6 +94,7 @@ OUTPUT_PHONE_COL = "Website Phone"
 OUTPUT_EMAIL_COL = "Website Email"
 OUTPUT_STAFF_EMAIL_STATUS_COL = "Staff Email Scan Status"
 OUTPUT_STAFF_EMAIL_NOTES_COL = "Staff Email Scan Notes"
+OUTPUT_STAFF_EMAIL_PAGES_COL = "Staff Email Scan Pages"
 OUTPUT_STAFF_EMAILS_COL = "Staff Emails"
 OUTPUT_CHAT_WIDGET_COL = "Chat Widget"
 OUTPUT_360_VIEWER_COL = "360° Vehicle Viewer"
@@ -815,31 +818,6 @@ def _staff_email_column(df: pd.DataFrame) -> str:
     return OUTPUT_STAFF_EMAILS_COL
 
 
-def _without_staff_source_urls(value: str) -> str:
-    """Remove the retired ``source_url`` field from prior staff-email outputs."""
-    try:
-        parsed = json.loads(value)
-    except (TypeError, json.JSONDecodeError):
-        return value
-
-    changed = False
-    if isinstance(parsed, list):
-        cleaned: list[Any] = []
-        for entry in parsed:
-            if isinstance(entry, dict) and "source_url" in entry:
-                cleaned.append({key: item for key, item in entry.items() if key != "source_url"})
-                changed = True
-            else:
-                cleaned.append(entry)
-        parsed = cleaned
-    elif isinstance(parsed, dict) and "source_url" in parsed:
-        parsed = {key: item for key, item in parsed.items() if key != "source_url"}
-        changed = True
-    if not changed:
-        return value
-    return json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
-
-
 def _staff_output_columns(df: pd.DataFrame, staff_email_col: str) -> list[str]:
     """Preserve every source column and append staff results/diagnostics."""
     columns = list(df.columns)
@@ -849,6 +827,8 @@ def _staff_output_columns(df: pd.DataFrame, staff_email_col: str) -> list[str]:
         columns.append(OUTPUT_STAFF_EMAIL_STATUS_COL)
     if OUTPUT_STAFF_EMAIL_NOTES_COL not in columns:
         columns.append(OUTPUT_STAFF_EMAIL_NOTES_COL)
+    if OUTPUT_STAFF_EMAIL_PAGES_COL not in columns:
+        columns.append(OUTPUT_STAFF_EMAIL_PAGES_COL)
     return columns
 
 
@@ -890,11 +870,35 @@ def _collect_staff_records(
     fetch_mode: str,
     headed: bool,
     page_limit: int,
+    scan_pages: list[dict[str, object]] | None = None,
 ) -> tuple[list[dict[str, str]], bool, int, int, int, str]:
     """Scan a dealer homepage plus a bounded set of likely staff/contact pages."""
     base = normalize_dealer_url(str(website) if website is not None else "")
     if not base:
         return [], False, 0, 0, 0, ""
+
+    details = scan_pages if scan_pages is not None else []
+
+    def inspect_loaded(
+        requested_url: str,
+        final_url: str,
+        page_html: str,
+        *,
+        browser_retry: bool = False,
+    ) -> list[dict[str, str]]:
+        found = extract_staff_email_records(page_html)
+        signals = inspect_staff_page(page_html)
+        details.append({
+            "requested_url": requested_url,
+            "final_url": final_url,
+            "result": "loaded",
+            "emails": len(found),
+            "named_staff": signals.named_staff,
+            "empty_listing": signals.empty_listing,
+            "contact_form": signals.contact_form,
+            "browser_retry": browser_retry,
+        })
+        return found
 
     homepage = fetch_dealer_html(
         base,
@@ -912,7 +916,7 @@ def _collect_staff_records(
     queue: list[str] = []
     if homepage:
         homepage_url, homepage_html = homepage
-        records.extend(extract_staff_email_records(homepage_html))
+        records.extend(inspect_loaded(base, homepage_url, homepage_html))
         pages_scanned = 1
         seen_urls.add(homepage_url.rstrip("/"))
         loaded_urls.add(homepage_url.rstrip("/"))
@@ -921,6 +925,8 @@ def _collect_staff_records(
         if final_host and final_host != original_host:
             redirected_host = final_host
         queue.extend(find_staff_page_urls(homepage_html, homepage_url, limit=page_limit))
+    else:
+        details.append({"requested_url": base, "result": "fetch failed"})
 
     # Some dealers publish /about-us/staff/ or /dealership/staff.htm but do
     # not link it from the homepage. Probe these when no useful staff page
@@ -947,9 +953,11 @@ def _collect_staff_records(
         except Exception as exc:
             log.debug("staff-email page fetch failed %s: %s", page_url, exc)
             pages_failed += 1
+            details.append({"requested_url": page_url, "result": "fetch failed"})
             continue
         if not fetched:
             pages_failed += 1
+            details.append({"requested_url": page_url, "result": "fetch failed"})
             continue
         final_url, page_html = fetched
         final_key = final_url.rstrip("/")
@@ -958,13 +966,60 @@ def _collect_staff_records(
         loaded_urls.add(final_key)
         pages_scanned += 1
         staff_pages_scanned += _is_staff_page(final_url)
-        records.extend(extract_staff_email_records(page_html))
+        records.extend(inspect_loaded(page_url, final_url, page_html))
         # An About/Contact page may expose a staff link absent from the home
         # navigation. Follow it without expanding to an unbounded site crawl.
         if not direct_added:
             for found in find_staff_page_urls(page_html, final_url, limit=page_limit):
                 if found.rstrip("/") not in seen_urls and found not in queue:
                     queue.append(found)
+
+    # HTTP can return a usable shell while contact details are rendered later.
+    # Retry at most two high-value pages in Chromium; do not retry every URL.
+    if not records and fetch_mode == FetchMode.AUTO.value and pages_scanned:
+        loaded_details = [detail for detail in details if detail.get("result") == "loaded"]
+
+        def retry_rank(detail: dict[str, object]) -> int:
+            url = str(detail.get("final_url", ""))
+            path = urlparse(url).path.lower()
+            if detail.get("named_staff"):
+                return 0
+            if "contact" in path or detail.get("contact_form"):
+                return 1
+            if _is_staff_page(url):
+                return 2
+            return 3
+
+        for detail in sorted(loaded_details, key=retry_rank)[:2]:
+            retry_url = str(detail.get("final_url", ""))
+            parsed = urlparse(retry_url)
+            retry_path = parsed.path or "/"
+            if parsed.query:
+                retry_path += "?" + parsed.query
+            try:
+                retried = fetch_dealer_html(
+                    retry_url, timeout=timeout, paths=(retry_path,),
+                    mode=FetchMode.BROWSER.value, headed=headed,
+                )
+            except Exception as exc:
+                log.debug("staff-email browser retry failed %s: %s", retry_url, exc)
+                retried = None
+            if not retried:
+                details.append({"requested_url": retry_url, "result": "browser retry failed", "browser_retry": True})
+                continue
+            final_url, page_html = retried
+            if homepage and retry_url.rstrip("/") == homepage[0].rstrip("/"):
+                initial_host = (urlparse(base).hostname or "").lower().removeprefix("www.")
+                retry_host = (urlparse(final_url).hostname or "").lower().removeprefix("www.")
+                if retry_host and retry_host != initial_host:
+                    redirected_host = retry_host
+            new_records = inspect_loaded(retry_url, final_url, page_html, browser_retry=True)
+            records.extend(new_records)
+            pages_scanned += 1
+            if _is_staff_page(final_url):
+                staff_pages_scanned += 1
+            if new_records:
+                break
     return (
         merge_staff_email_records(records), pages_scanned > 0,
         pages_scanned, pages_failed, staff_pages_scanned, redirected_host,
@@ -1071,6 +1126,8 @@ def enrich_staff_emails_file(
     results: dict[int, str] = {}
     scan_status: dict[int, str] = {}
     scan_notes: dict[int, str] = {}
+    scan_page_json: dict[int, str] = {}
+    cleanup_notes: dict[int, str] = {}
     rows_to_scan: list[tuple[int, str, str, str]] = []
     no_website = 0
     already_present = 0
@@ -1088,12 +1145,18 @@ def enrich_staff_emails_file(
             if staff_email_column in df.columns
             else ""
         )
+        if existing and existing.strip() != "[]":
+            cleaned, removed, cleared = clean_staff_email_records(existing)
+            existing = cleaned
+            if removed or cleared:
+                cleanup_notes[idx] = (
+                    f"Cleaned {removed} invalid/duplicate email(s) "
+                    f"and {cleared} misleading metadata field(s)."
+                )
         if _has_enrichment_value(existing) and existing.strip() != "[]":
-            # Preserve actual findings. An empty array is not a finding and
-            # may have been caused by a failed fetch or missed staff page.
-            # The one safe normalization is stripping source_url, a retired
-            # field that must no longer appear in Staff Emails JSON.
-            results[idx] = _without_staff_source_urls(existing)
+            # Preserve plausible findings, but normalize obvious false positives.
+            # An empty array is not a finding and may be retried.
+            results[idx] = existing
             prior_status = (
                 _serialize_cell(df.at[idx, OUTPUT_STAFF_EMAIL_STATUS_COL])
                 if OUTPUT_STAFF_EMAIL_STATUS_COL in df.columns
@@ -1105,7 +1168,14 @@ def enrich_staff_emails_file(
                 if OUTPUT_STAFF_EMAIL_NOTES_COL in df.columns
                 else ""
             )
-            scan_notes[idx] = prior_note or "Existing staff emails retained; not rescanned."
+            scan_notes[idx] = (prior_note or "Existing staff emails retained; not rescanned.")
+            if idx in cleanup_notes:
+                scan_notes[idx] += " " + cleanup_notes[idx]
+            scan_page_json[idx] = (
+                _serialize_cell(df.at[idx, OUTPUT_STAFF_EMAIL_PAGES_COL])
+                if OUTPUT_STAFF_EMAIL_PAGES_COL in df.columns
+                else "[]"
+            ) or "[]"
             already_present += 1
             continue
         url = normalize_dealer_url(website_value)
@@ -1113,14 +1183,18 @@ def enrich_staff_emails_file(
             results[idx] = "[]"
             scan_status[idx] = "No website"
             scan_notes[idx] = "No usable website URL."
+            if idx in cleanup_notes:
+                scan_notes[idx] += " " + cleanup_notes[idx]
+            scan_page_json[idx] = "[]"
             no_website += 1
             continue
         prior_email = _serialize_cell(df.at[idx, OUTPUT_EMAIL_COL]) if OUTPUT_EMAIL_COL in df.columns else ""
         dealer_name = _serialize_cell(df.at[idx, dealer_name_column]) if dealer_name_column else ""
         rows_to_scan.append((idx, website_value, prior_email, dealer_name))
 
-    def task(item: tuple[int, str, str, str]) -> tuple[int, str, str, str, bool, int]:
+    def task(item: tuple[int, str, str, str]) -> tuple[int, str, str, str, str, bool, int]:
         idx, website, prior_email, dealer_name = item
+        pages: list[dict[str, object]] = []
         try:
             records, loaded, pages_scanned, pages_failed, staff_pages_scanned, redirected_host = _collect_staff_records(
                 website,
@@ -1128,6 +1202,7 @@ def enrich_staff_emails_file(
                 fetch_mode=fetch_mode,
                 headed=headed,
                 page_limit=page_limit,
+                scan_pages=pages,
             )
             found_on_site = len(records)
             if not records and (fallback := _previous_website_email(prior_email, website, dealer_name)):
@@ -1139,18 +1214,34 @@ def enrich_staff_emails_file(
                 status = "Reused website email"
                 note = "No new email extracted; reused existing Website Email."
             elif loaded:
-                status = "No email on staff page" if staff_pages_scanned else "No staff page reached"
+                if any(page.get("named_staff") for page in pages):
+                    status = "Staff listed, no email"
+                elif any(page.get("empty_listing") for page in pages):
+                    status = "Empty staff listing"
+                elif any(page.get("contact_form") for page in pages):
+                    status = "Contact form only"
+                else:
+                    status = "No staff listing verified" if staff_pages_scanned else "No staff page reached"
                 note = f"No public email extracted from {pages_scanned} loaded page(s)."
             else:
                 status = "Fetch failed"
                 note = "Website and candidate staff pages could not be loaded."
             if loaded:
-                note += f" {staff_pages_scanned} staff-like page(s) loaded."
+                note += f" {staff_pages_scanned} staff-like URL(s) loaded."
+            named_staff = max((int(page.get("named_staff", 0)) for page in pages), default=0)
+            if named_staff and not found_on_site:
+                note += f" At least {named_staff} named staff card(s) observed."
             if pages_failed:
                 note += f" {pages_failed} page fetch(es) failed."
+            browser_retries = sum(bool(page.get("browser_retry")) for page in pages)
+            if browser_retries:
+                note += f" {browser_retries} browser retry result(s)."
             if redirected_host:
                 note += f" Homepage redirected to {redirected_host}."
-            return idx, json.dumps(records, ensure_ascii=False, separators=(",", ":")), status, note, loaded, pages_scanned
+            if idx in cleanup_notes:
+                note += " " + cleanup_notes[idx]
+            page_json = json.dumps(pages, ensure_ascii=False, separators=(",", ":"))
+            return idx, json.dumps(records, ensure_ascii=False, separators=(",", ":")), status, note, page_json, loaded, pages_scanned
         except Exception as exc:
             # One unusual dealer CMS must not prevent the rest of the CSV from
             # receiving its new append-only column.
@@ -1161,7 +1252,10 @@ def enrich_staff_emails_file(
             if fallback:
                 note += " Reused existing Website Email."
             status = "Reused website email" if fallback else "Scan error"
-            return idx, json.dumps(records, ensure_ascii=False, separators=(",", ":")), status, note, False, 0
+            if idx in cleanup_notes:
+                note += " " + cleanup_notes[idx]
+            page_json = json.dumps(pages, ensure_ascii=False, separators=(",", ":"))
+            return idx, json.dumps(records, ensure_ascii=False, separators=(",", ":")), status, note, page_json, False, 0
 
     unloaded = 0
     additional_pages_scanned = 0
@@ -1174,10 +1268,11 @@ def enrich_staff_emails_file(
                 desc=f"staff emails: {input_path.name}",
                 unit="site",
             ):
-                idx, staff_json, status, note, loaded, pages_scanned = future.result()
+                idx, staff_json, status, note, page_json, loaded, pages_scanned = future.result()
                 results[idx] = staff_json
                 scan_status[idx] = status
                 scan_notes[idx] = note
+                scan_page_json[idx] = page_json
                 additional_pages_scanned += max(pages_scanned - 1, 0)
                 if not loaded:
                     unloaded += 1
@@ -1190,6 +1285,7 @@ def enrich_staff_emails_file(
             row[staff_email_column] = results.get(idx, "[]")
             row[OUTPUT_STAFF_EMAIL_STATUS_COL] = scan_status.get(idx, "Scan not completed")
             row[OUTPUT_STAFF_EMAIL_NOTES_COL] = scan_notes.get(idx, "Staff-email scan not completed.")
+            row[OUTPUT_STAFF_EMAIL_PAGES_COL] = scan_page_json.get(idx, "[]")
             writer.append(row)
     finally:
         writer.close()
@@ -1430,7 +1526,8 @@ def main() -> None:
         choices=("auto", "http", "browser"),
         default="auto",
         help=(
-            "How to load dealer sites: auto=HTTP then browser if blocked (default), "
+            "How to load dealer sites: auto=HTTP then browser if blocked; staff-only also retries "
+            "up to two empty loaded pages in browser (default), "
             "http=fast curl_cffi only, browser=Playwright Chromium"
         ),
     )

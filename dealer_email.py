@@ -92,6 +92,25 @@ _BLOCKED_DOMAINS = frozenset(
 )
 
 _BLOCKED_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".css", ".js")
+_VALID_EMAIL_RE = re.compile(
+    r"[a-z0-9](?:[a-z0-9._%+-]*[a-z0-9])?@[a-z0-9](?:[a-z0-9-]*[a-z0-9])?"
+    r"(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+",
+    re.I,
+)
+_PROSE_DOMAIN_ENDINGS = frozenset({"you", "we", "upon", "told", "great", "fill", "son"})
+_GENERIC_NAME_RE = re.compile(
+    r"^(?:how to reach us|select primary|review us|new inventory|store hours|"
+    r"search vehicles|total price|browse through our inventory|used vehicles|"
+    r"we welcome your feedback and comments|contact us|learn more|read more|"
+    r"how to|address\s*&|make an inquiry|leave a message below|"
+    r"your options regarding marketing communications|translate website|"
+    r"business hours|about la motors)$",
+    re.I,
+)
+_GENERIC_ROLE_RE = re.compile(
+    r"(?:\bhours\b|\brequired field\b|\bhow to reach us\b|\bsearch by keyword\b)",
+    re.I,
+)
 
 
 def _normalize_email(raw: str) -> str | None:
@@ -104,6 +123,10 @@ def _normalize_email(raw: str) -> str | None:
     text = text.split("?", 1)[0].strip()
     if not text or "@" not in text:
         return None
+    if not _VALID_EMAIL_RE.fullmatch(text):
+        return None
+    if ".." in text:
+        return None
     if any(text.endswith(s) for s in _BLOCKED_SUFFIXES):
         return None
 
@@ -115,6 +138,19 @@ def _normalize_email(raw: str) -> str | None:
         return None
     if any(domain.endswith(f".{blocked}") for blocked in _BLOCKED_DOMAINS):
         return None
+    labels = domain.split(".")
+    if not re.fullmatch(r"[a-z]{2,63}", labels[-1]):
+        return None
+    if any(
+        len(re.sub(r"\D", "", label)) >= 6 and re.fullmatch(r"\d+(?:-\d+)+", label)
+        for label in labels[:-1]
+    ):
+        return None
+    if labels[-1] in _PROSE_DOMAIN_ENDINGS and (
+        len(labels) > 2 and labels[-2] in {"com", "net", "org", "edu", "gov", "io"}
+        or labels[-1] in {"upon", "told", "great", "fill", "son"}
+    ):
+        return None
 
     local_base = local.split("+", 1)[0]
     if local_base in _INVALID_LOCAL_PARTS:
@@ -122,6 +158,59 @@ def _normalize_email(raw: str) -> str | None:
     if len(local) > 64 or len(domain) > 255:
         return None
     return f"{local}@{domain}"
+
+
+def clean_staff_email_records(value: str) -> tuple[str, int, int]:
+    """Conservatively clean prior JSON without discarding plausible contacts.
+
+    Returns serialized JSON plus counts of rejected addresses and cleared
+    metadata fields. Non-JSON values are left untouched for review.
+    """
+    try:
+        parsed = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return value, 0, 0
+    if not isinstance(parsed, list):
+        return value, 0, 0
+    cleaned: list[object] = []
+    removed = 0
+    cleared = 0
+    changed = False
+    seen: set[str] = set()
+    for entry in parsed:
+        if not isinstance(entry, dict):
+            cleaned.append(entry)
+            continue
+        item = {key: field_value for key, field_value in entry.items() if key != "source_url"}
+        changed |= len(item) != len(entry)
+        email = _normalize_email(str(item.get("email", "")))
+        if not email:
+            removed += 1
+            changed = True
+            continue
+        if email in seen:
+            removed += 1
+            changed = True
+            continue
+        seen.add(email)
+        if item.get("email") != email:
+            item["email"] = email
+            changed = True
+        name = _clean_text(str(item.get("name", "")))
+        role = _clean_text(str(item.get("role", "")))
+        if name and _GENERIC_NAME_RE.fullmatch(name):
+            item["name"] = ""
+            cleared += 1
+            changed = True
+            name = ""
+        if role and (_GENERIC_ROLE_RE.search(role) or not name and _GENERIC_NAME_RE.fullmatch(_clean_text(str(entry.get("name", ""))))):
+            item["role"] = ""
+            cleared += 1
+            changed = True
+        cleaned.append(item)
+    if not changed:
+        return value, removed, cleared
+    return json.dumps(cleaned, ensure_ascii=False, separators=(",", ":")), removed, cleared
 
 
 def _decode_cloudflare_email(value: str) -> str | None:
@@ -376,6 +465,8 @@ def _probably_name(value: str) -> str:
     text = re.sub(r"\b(?:email|contact|call|phone|tel)\b.*$", "", text, flags=re.I).strip(" -|:")
     if not text or "@" in text or len(text) > 90 or re.search(r"\d{3,}", text):
         return ""
+    if _GENERIC_NAME_RE.fullmatch(text):
+        return ""
     words = text.split()
     if not 2 <= len(words) <= 6:
         return ""
@@ -409,6 +500,8 @@ _INFERRED_JOB_WORD_RE = re.compile(
 def _probably_role(value: str, *, inferred: bool = False) -> str:
     text = _clean_text(value).strip(" -|:")
     if not text or "@" in text or len(text) > 120 or re.search(r"\d{4,}", text):
+        return ""
+    if _GENERIC_ROLE_RE.search(text):
         return ""
     if re.search(r"\b(?:email|contact|phone|tel|directions|hours|our location|dealership info|our staff|coming soon)\b", text, re.I):
         return ""
@@ -624,6 +717,68 @@ def extract_staff_email_records(html: str) -> list[dict[str, str]]:
             if email:
                 records.append({"email": email, "name": name, "role": role})
     return _merge_staff_records(records)
+
+
+@dataclass(frozen=True)
+class StaffPageSignals:
+    named_staff: int = 0
+    empty_listing: bool = False
+    contact_form: bool = False
+
+
+_EMPTY_STAFF_RE = re.compile(
+    r"(?:no staff members listed|no staff found|no team members listed|"
+    r"no employees listed|staff information (?:is )?unavailable)",
+    re.I,
+)
+
+
+def inspect_staff_page(html: str) -> StaffPageSignals:
+    """Find evidence of actual staff content, not merely a staff-shaped URL."""
+    parser = _TreeParser()
+    try:
+        parser.feed(html or "")
+        parser.close()
+    except Exception:
+        return StaffPageSignals()
+    visible = _visible_node_text(parser.root)
+    empty_listing = bool(_EMPTY_STAFF_RE.search(visible))
+    contact_form = False
+    names: set[str] = set()
+    for node in parser.nodes:
+        if _has_non_visible_ancestor(node):
+            continue
+        if node.tag == "form":
+            fields = _descendants(node)
+            has_email = any(
+                child.tag == "input"
+                and (child.attrs.get("type", "").lower() == "email" or "email" in child.attrs.get("name", "").lower())
+                for child in fields
+            )
+            has_contact_fields = any(
+                child.tag == "textarea" or child.tag == "input" and re.search(
+                    r"(?:name|phone|message|comment)", child.attrs.get("name", "") + " " + child.attrs.get("id", ""), re.I
+                )
+                for child in fields
+            )
+            contact_form |= has_email and has_contact_fields
+        if node.tag not in {"li", "article", "div", "section"}:
+            continue
+        is_card = _is_person_container(node)
+        if not is_card and node.tag not in {"li", "article"}:
+            continue
+        if len(_visible_node_text(node)) > 1_200:
+            continue
+        headings = [child for child in _descendants(node) if child.tag in _HEADING_TAGS]
+        if not is_card and node.tag in {"li", "article"}:
+            is_card = any(_probably_role(_visible_node_text(child), inferred=True) for child in headings)
+        if not is_card:
+            continue
+        for child in _descendants(node):
+            if child.tag in _HEADING_TAGS or _NAME_HINT_RE.search(child.attr_text()):
+                if name := _probably_name(_visible_node_text(child)):
+                    names.add(name)
+    return StaffPageSignals(len(names), empty_listing, contact_form)
 
 
 def _site_host(url: str) -> str:
