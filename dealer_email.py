@@ -25,7 +25,7 @@ _EMAIL_RE = re.compile(
 )
 _OBFUSCATED_EMAIL_RE = re.compile(
     r"\b([a-zA-Z0-9][a-zA-Z0-9._%+-]*)\s*"
-    r"(?:\[\s*at\s*\]|\(\s*at\s*\)|\{\s*at\s*\}|@|\bat\b)\s*"
+    r"(?:\[\s*at\s*\]|\(\s*at\s*\)|\{\s*at\s*\})\s*"
     r"([a-zA-Z0-9-]+(?:\s*(?:\[\s*dot\s*\]|\(\s*dot\s*\)|\{\s*dot\s*\}|\bdot\b|\.)\s*"
     r"[a-zA-Z0-9-]+)+)\b",
     re.I,
@@ -48,7 +48,7 @@ _ROLE_HINT_RE = re.compile(
 )
 _STAFF_LINK_RE = re.compile(
     r"(?:contact(?:[-_ ]?us)?|staff|our[-_ ]?team|meet[-_ ]?(?:the[-_ ]?)?(?:team|staff)|"
-    r"team|people|leadership|management|directory|employees?|associates?|our[-_ ]?people|"
+    r"team|people|bios?|leadership|management|directory|employees?|associates?|our[-_ ]?people|"
     r"who[-_ ]?we[-_ ]?are|about[-_ ]?us|dealership[-_ ]?team|meet[-_ ]?our)",
     re.I,
 )
@@ -379,7 +379,13 @@ def _probably_name(value: str) -> str:
     words = text.split()
     if not 2 <= len(words) <= 6:
         return ""
-    if any(word.lower() in {"contact", "email", "sales", "service", "department", "team", "staff"} for word in words):
+    if any(word.lower() in {"contact", "email", "sales", "service", "department", "team", "staff", "hours", "location", "dealership"} for word in words):
+        return ""
+    if text.lower() in {"coming soon", "learn more", "read more", "call us", "about us", "get directions", "our inventory"}:
+        return ""
+    if re.search(r"\b(?:first name|last name|full name|your name)\b", text, re.I):
+        return ""
+    if re.search(r"\b(?:car|auto|motor|vehicle)\s+(?:center|centre|sales|group|dealership)\b", text, re.I):
         return ""
     if not any(any(ch.isalpha() for ch in word) for word in words):
         return ""
@@ -390,7 +396,9 @@ def _probably_role(value: str) -> str:
     text = _clean_text(value).strip(" -|:")
     if not text or "@" in text or len(text) > 120 or re.search(r"\d{4,}", text):
         return ""
-    if re.search(r"\b(?:email|contact|phone|tel|directions)\b", text, re.I):
+    if re.search(r"\b(?:email|contact|phone|tel|directions|business hours|opening hours|our location|dealership info|our staff|coming soon)\b", text, re.I):
+        return ""
+    if re.search(r"\b(?:car|auto|motor|vehicle)\s+(?:center|centre|sales|group|dealership)\b", text, re.I):
         return ""
     return text
 
@@ -407,6 +415,10 @@ def _has_role_hint(node: _HtmlNode) -> bool:
 
 def _staff_metadata(node: _HtmlNode) -> tuple[str, str]:
     """Infer a card's name and role from semantic attributes/headings."""
+    # Global chrome commonly has a dealership-name heading and an hours block
+    # beside a footer email. They are not the mailbox owner's name/job title.
+    if any(parent.tag in {"footer", "header", "nav"} for parent in _node_and_ancestors(node)):
+        return "", ""
     context, is_person_card = _context_node(node)
     candidates = [context, *_descendants(context)]
     name = _probably_name(
@@ -474,6 +486,8 @@ def _staff_metadata(node: _HtmlNode) -> tuple[str, str]:
             if possible and possible != name:
                 role = possible
                 break
+    if not name:
+        role = ""
     return name, role
 
 
@@ -632,7 +646,7 @@ def find_staff_page_urls(html: str, base_url: str, *, limit: int = 8) -> list[st
         if not _STAFF_LINK_RE.search(haystack):
             continue
         score = 0
-        if re.search(r"staff|team|meet|leadership|management|directory|people|employee|associate", haystack, re.I):
+        if re.search(r"staff|team|meet|bio|leadership|management|directory|people|employee|associate", haystack, re.I):
             score += 4
         if re.search(r"contact", haystack, re.I):
             score += 3
