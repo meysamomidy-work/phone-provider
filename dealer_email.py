@@ -379,7 +379,12 @@ def _probably_name(value: str) -> str:
     words = text.split()
     if not 2 <= len(words) <= 6:
         return ""
-    if any(word.lower() in {"contact", "email", "sales", "service", "department", "team", "staff", "hours", "location", "dealership"} for word in words):
+    if any(word.lower() in {
+        "contact", "email", "sales", "service", "department", "team", "staff",
+        "hours", "location", "dealership", "search", "vehicles", "total",
+        "price", "feedback", "comments", "welcome", "keyword", "inventory",
+        "dealer", "info", "we", "your",
+    } for word in words):
         return ""
     if text.lower() in {"coming soon", "learn more", "read more", "call us", "about us", "get directions", "our inventory"}:
         return ""
@@ -392,13 +397,24 @@ def _probably_name(value: str) -> str:
     return text
 
 
-def _probably_role(value: str) -> str:
+_INFERRED_JOB_WORD_RE = re.compile(
+    r"\b(?:manager|director|consultant|advisor|principal|coordinator|specialist|"
+    r"technician|associate|president|owner|executive|representative|lead|agent|"
+    r"sales|finance|service|parts|internet|business|accountant|receptionist|"
+    r"administrator|controller|buyer|detailer|mechanic|porter|operations|marketing)\b",
+    re.I,
+)
+
+
+def _probably_role(value: str, *, inferred: bool = False) -> str:
     text = _clean_text(value).strip(" -|:")
     if not text or "@" in text or len(text) > 120 or re.search(r"\d{4,}", text):
         return ""
-    if re.search(r"\b(?:email|contact|phone|tel|directions|business hours|opening hours|our location|dealership info|our staff|coming soon)\b", text, re.I):
+    if re.search(r"\b(?:email|contact|phone|tel|directions|hours|our location|dealership info|our staff|coming soon)\b", text, re.I):
         return ""
     if re.search(r"\b(?:car|auto|motor|vehicle)\s+(?:center|centre|sales|group|dealership)\b", text, re.I):
+        return ""
+    if inferred and not _INFERRED_JOB_WORD_RE.search(text):
         return ""
     return text
 
@@ -466,7 +482,7 @@ def _staff_metadata(node: _HtmlNode) -> tuple[str, str]:
         for tag, heading in headings:
             if tag in {"strong", "b"} or heading == name:
                 continue
-            possible = _probably_role(heading)
+            possible = _probably_role(heading, inferred=True)
             if possible:
                 role = possible
                 break
@@ -474,7 +490,7 @@ def _staff_metadata(node: _HtmlNode) -> tuple[str, str]:
         for candidate in _descendants(context):
             if candidate.tag not in {"p", "span", "div", "small"}:
                 continue
-            possible = _probably_role(candidate.text())
+            possible = _probably_role(candidate.text(), inferred=True)
             if possible and possible != name:
                 role = possible
                 break
@@ -482,7 +498,7 @@ def _staff_metadata(node: _HtmlNode) -> tuple[str, str]:
         full_text = _visible_node_text(context)
         remainder = _clean_text(full_text.replace(name, "", 1))
         for part in re.split(r"[|•\n]", remainder):
-            possible = _probably_role(part)
+            possible = _probably_role(part, inferred=True)
             if possible and possible != name:
                 role = possible
                 break
