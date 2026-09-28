@@ -90,6 +90,10 @@ _BLOCKED_DOMAINS = frozenset(
         "yoursite.com",
     }
 )
+_BLOCKED_VENDOR_EXACT_DOMAINS = frozenset({
+    "dealerinspire.com", "dealeron.com", "carsforsale.com",
+    "intice.com", "edealerhub.com", "eautodealerhub.com",
+})
 
 _BLOCKED_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".css", ".js")
 _VALID_EMAIL_RE = re.compile(
@@ -97,18 +101,37 @@ _VALID_EMAIL_RE = re.compile(
     r"(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+",
     re.I,
 )
-_PROSE_DOMAIN_ENDINGS = frozenset({"you", "we", "upon", "told", "great", "fill", "son"})
+_PROSE_DOMAIN_ENDINGS = frozenset({
+    # These are sentence fragments seen after an @ sign in rendered dealer
+    # pages, not usable mail domains. Keep this narrow: uncommon real TLDs
+    # are otherwise allowed, especially for explicit mailto links.
+    "again", "allen", "and", "apply", "bring", "brought", "cim",
+    "dohmann", "everyone", "fill", "great", "he", "if", "job", "left",
+    "located", "mandeville", "on", "our", "ponchatoula", "she", "son",
+    "that", "these", "they", "told", "two", "upon", "used", "we",
+    "we", "whether", "with",
+})
+_PROSE_SECOND_LEVEL = frozenset({
+    "0", "all", "com", "home", "it", "legacy", "net", "online",
+    "org", "our", "the", "you",
+})
+_PROSE_AMBIGUOUS_ENDINGS = frozenset({"as", "by", "it", "my", "you"})
 _GENERIC_NAME_RE = re.compile(
     r"^(?:how to reach us|select primary|review us|new inventory|store hours|"
     r"search vehicles|total price|browse through our inventory|used vehicles|"
     r"we welcome your feedback and comments|contact us|learn more|read more|"
     r"how to|address\s*&|make an inquiry|leave a message below|"
     r"your options regarding marketing communications|translate website|"
-    r"business hours|about la motors)$",
+    r"business hours|about\b.*|meet (?:the|our) staff\b.*|"
+    r"privacy policy|job openings|"
+    r"have additional questions\??|how to purchase online|"
+    r"welcome to our dealership!?|first name(?: last name)?\s*\*?)$",
     re.I,
 )
 _GENERIC_ROLE_RE = re.compile(
-    r"(?:\bhours\b|\brequired field\b|\bhow to reach us\b|\bsearch by keyword\b)",
+    r"(?:\bhours\b|\brequired field\b|\bhow to reach us\b|\bsearch by keyword\b|"
+    r"\bmeet (?:the|our) staff\b|\bprivacy policy\b|\bjob openings\b|"
+    r"\bapply for position\b|\bget in touch\b)",
     re.I,
 )
 
@@ -134,7 +157,7 @@ def _normalize_email(raw: str) -> str | None:
     domain = domain.rstrip(".")
     if not local or not domain or "." not in domain:
         return None
-    if domain in _BLOCKED_DOMAINS:
+    if domain in _BLOCKED_DOMAINS or domain in _BLOCKED_VENDOR_EXACT_DOMAINS:
         return None
     if any(domain.endswith(f".{blocked}") for blocked in _BLOCKED_DOMAINS):
         return None
@@ -146,10 +169,9 @@ def _normalize_email(raw: str) -> str | None:
         for label in labels[:-1]
     ):
         return None
-    if labels[-1] in _PROSE_DOMAIN_ENDINGS and (
-        len(labels) > 2 and labels[-2] in {"com", "net", "org", "edu", "gov", "io"}
-        or labels[-1] in {"upon", "told", "great", "fill", "son"}
-    ):
+    if labels[-1] in _PROSE_DOMAIN_ENDINGS:
+        return None
+    if labels[-1] in _PROSE_AMBIGUOUS_ENDINGS and labels[-2] in _PROSE_SECOND_LEVEL:
         return None
 
     local_base = local.split("+", 1)[0]
@@ -160,7 +182,31 @@ def _normalize_email(raw: str) -> str | None:
     return f"{local}@{domain}"
 
 
-def clean_staff_email_records(value: str) -> tuple[str, int, int]:
+def _name_matches_email(name: str, email: str) -> bool:
+    """Use a mailbox's local part only to disambiguate repeated names."""
+    words = re.findall(r"[a-z]+", name.casefold())
+    if len(words) < 2:
+        return False
+    first, last = words[0], words[-1]
+    local = re.sub(r"[^a-z]", "", email.split("@", 1)[0].split("+", 1)[0].casefold())
+    return bool(
+        local == first and len(first) >= 3
+        or last in local and (first in local or local.startswith(first[:1] + last) or local == last)
+    )
+
+
+def _is_department_list(value: str) -> bool:
+    words = re.findall(r"[a-z]+", value.casefold())
+    return bool(
+        len(words) >= 3 and len(set(words)) >= 2
+        and set(words) <= {
+            "management", "sales", "service", "parts", "office",
+            "department", "staff", "team", "customer",
+        }
+    )
+
+
+def clean_staff_email_records(value: str, dealer_name: str = "") -> tuple[str, int, int]:
     """Conservatively clean prior JSON without discarding plausible contacts.
 
     Returns serialized JSON plus counts of rejected addresses and cleared
@@ -177,6 +223,7 @@ def clean_staff_email_records(value: str) -> tuple[str, int, int]:
     cleared = 0
     changed = False
     seen: set[str] = set()
+    dealer_label = re.sub(r"[^a-z0-9]+", "", dealer_name.casefold())
     for entry in parsed:
         if not isinstance(entry, dict):
             cleaned.append(entry)
@@ -198,16 +245,89 @@ def clean_staff_email_records(value: str) -> tuple[str, int, int]:
             changed = True
         name = _clean_text(str(item.get("name", "")))
         role = _clean_text(str(item.get("role", "")))
-        if name and _GENERIC_NAME_RE.fullmatch(name):
+        name_label = re.sub(r"[^a-z0-9]+", "", name.casefold())
+        is_dealer_heading = bool(
+            dealer_label and name_label == dealer_label
+            and email.split("@", 1)[0] in {
+                "info", "sales", "contact", "contactus", "hello", "office",
+                "support", "service", "parts", "general",
+            }
+        )
+        if name and (_GENERIC_NAME_RE.fullmatch(name) or is_dealer_heading):
             item["name"] = ""
             cleared += 1
             changed = True
             name = ""
-        if role and (_GENERIC_ROLE_RE.search(role) or not name and _GENERIC_NAME_RE.fullmatch(_clean_text(str(entry.get("name", ""))))):
+        if role and (
+            _GENERIC_ROLE_RE.search(role)
+            or _is_department_list(role)
+            or not name and _GENERIC_NAME_RE.fullmatch(_clean_text(str(entry.get("name", ""))))
+            or not name and is_dealer_heading
+            or name and role.casefold() == name.casefold()
+        ):
             item["role"] = ""
             cleared += 1
             changed = True
         cleaned.append(item)
+    # A broad staff-list wrapper can make one employee's name appear as the
+    # role on another employee's record. Do not preserve that as a job title.
+    known_names = {
+        _clean_text(str(item.get("name", ""))).casefold()
+        for item in cleaned if isinstance(item, dict) and item.get("name")
+    }
+    for item in cleaned:
+        if not isinstance(item, dict):
+            continue
+        role = _clean_text(str(item.get("role", "")))
+        if role and role.casefold() in known_names and _probably_name(role):
+            item["role"] = ""
+            cleared += 1
+            changed = True
+    repeated_names: dict[str, list[dict[str, str]]] = {}
+    repeated_roles: dict[str, list[dict[str, str]]] = {}
+    for item in cleaned:
+        if not isinstance(item, dict):
+            continue
+        if name := _clean_text(str(item.get("name", ""))):
+            repeated_names.setdefault(name.casefold(), []).append(item)
+        if role := _clean_text(str(item.get("role", ""))):
+            repeated_roles.setdefault(role.casefold(), []).append(item)
+    for group in repeated_names.values():
+        if len(group) < 3:
+            continue
+        for item in group:
+            if not _name_matches_email(str(item["name"]), str(item["email"])):
+                item["name"] = ""
+                cleared += 1
+                changed = True
+    for group in repeated_roles.values():
+        if len(group) < 3:
+            continue
+        role = _clean_text(str(group[0]["role"]))
+        words = role.split()
+        if len(words) < 3:
+            continue
+        possible_name = " ".join(words[:2])
+        actual_role = " ".join(words[2:])
+        if not _probably_name(possible_name) or not _probably_role(actual_role, inferred=True):
+            continue
+        matches = [item for item in group if _name_matches_email(possible_name, str(item["email"]))]
+        if len(matches) > 1:
+            continue
+        for item in group:
+            if matches and item is matches[0]:
+                if not item.get("name"):
+                    item["name"] = possible_name
+                    cleared += 1
+                    changed = True
+                if item["role"] != actual_role:
+                    item["role"] = actual_role
+                    cleared += 1
+                    changed = True
+            elif item.get("role"):
+                item["role"] = ""
+                cleared += 1
+                changed = True
     if not changed:
         return value, removed, cleared
     return json.dumps(cleaned, ensure_ascii=False, separators=(",", ":")), removed, cleared
@@ -436,10 +556,16 @@ def _context_node(node: _HtmlNode) -> tuple[_HtmlNode, bool]:
         # A normal <li>/<article> with H3/H4 staff data is a valid card even
         # when a CMS gives it a generic class.  This is the markup used by
         # Dealer Inspire (including Kendall Toyota of Anchorage).
+        probable_names = {
+            name for child in _descendants(candidate)
+            if child.tag in _HEADING_TAGS
+            if (name := _probably_name(_visible_node_text(child)))
+        }
         score = 20 if is_person else 0
         score += 8 if has_heading else 0
-        score += 3 if candidate.tag in {"li", "article", "address"} else 1
+        score += 8 if candidate.tag in {"li", "article", "address"} else 1
         score += max(0, 4 - position)  # prefer the nearest qualifying card
+        score -= 15 * max(0, len(probable_names) - 1)
         if best is None or score > best[0]:
             best = (score, candidate, is_person or has_heading)
     if best is not None:
@@ -473,8 +599,11 @@ def _probably_name(value: str) -> str:
     if any(word.lower() in {
         "contact", "email", "sales", "service", "department", "team", "staff",
         "hours", "location", "dealership", "search", "vehicles", "total",
-        "price", "feedback", "comments", "welcome", "keyword", "inventory",
+        "feedback", "comments", "welcome", "keyword", "inventory",
         "dealer", "info", "we", "your",
+        "manager", "director", "consultant", "advisor", "owner", "president",
+        "specialist", "policy", "privacy", "about", "openings", "questions",
+        "car", "auto", "new", "used", "leasing", "and", "&",
     } for word in words):
         return ""
     if text.lower() in {"coming soon", "learn more", "read more", "call us", "about us", "get directions", "our inventory"}:
@@ -503,9 +632,13 @@ def _probably_role(value: str, *, inferred: bool = False) -> str:
         return ""
     if _GENERIC_ROLE_RE.search(text):
         return ""
+    if _is_department_list(text):
+        return ""
     if re.search(r"\b(?:email|contact|phone|tel|directions|hours|our location|dealership info|our staff|coming soon)\b", text, re.I):
         return ""
-    if re.search(r"\b(?:car|auto|motor|vehicle)\s+(?:center|centre|sales|group|dealership)\b", text, re.I):
+    if re.search(r"\b(?:car|auto|motor|vehicle)\s+(?:center|centre|sales|group|dealership)\b", text, re.I) and not re.search(
+        r"\b(?:manager|consultant|advisor|director|specialist|associate|representative)\b", text, re.I
+    ):
         return ""
     if inferred and not _INFERRED_JOB_WORD_RE.search(text):
         return ""
@@ -556,7 +689,9 @@ def _staff_metadata(node: _HtmlNode) -> tuple[str, str]:
             _has_role_hint(candidate)
             or candidate.attrs.get("itemprop", "").lower() in {"jobtitle", "role"}
         ):
-            role = _probably_role(text)
+            possible_role = _probably_role(text)
+            if possible_role.casefold() != name.casefold():
+                role = possible_role
         if candidate.tag in _HEADING_TAGS:
             heading = _clean_text(text)
             if heading and len(heading) <= 120:
@@ -569,6 +704,8 @@ def _staff_metadata(node: _HtmlNode) -> tuple[str, str]:
             name = _probably_name(heading)
             if name:
                 break
+    if name and role.casefold() == name.casefold():
+        role = ""
     # Some dealer platforms use an H3 followed by an H4 rather than classes
     # such as `job-title`; use the following heading as the role.
     if is_person_card and not role and name:

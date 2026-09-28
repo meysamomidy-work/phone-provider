@@ -11,9 +11,10 @@ python enrich_dealers.py ..\google-maps\enriched_new -t 6 --fetch-mode auto
 
 To extend an existing dealer file with public contact/staff emails without
 running the other enrichers, use `--staff-emails-only`. The source file is
-never edited: the result is written to `enriched_v6/` by default (or to `-o`).
-All source columns are retained exactly and one append-only `Staff Emails`
-column is added.
+never edited: a versioned `enriched_vN/` input writes to `enriched_v(N+1)/`
+by default (or to `-o` for one file). All unrelated source columns are retained.
+The pass writes `Staff Emails`, `Staff Email Scan Status`,
+`Staff Email Scan Notes`, and `Staff Email Scan Pages`.
 
 ```powershell
 python enrich_dealers.py ..\google-maps\enriched_new\dealers.csv `
@@ -21,11 +22,12 @@ python enrich_dealers.py ..\google-maps\enriched_new\dealers.csv `
 ```
 
 The worker launcher supports the same focused pass. Its fifth positional
-argument selects `deep` (default), `standard`, or `staff`; the optional sixth
-argument sets the staff-page limit:
+argument selects `deep` (default), `standard`, `staff`, or `staff-refresh`;
+the optional sixth argument sets the staff-page limit:
 
 ```bat
 run_workers.bat dealers.csv 6 2 0 staff 8
+run_workers.bat enriched_v8\Louisiana.csv 1 2 0 staff-refresh 8
 ```
 
 `Staff Emails` is compact JSON so CSV and Excel consumers retain the person
@@ -39,9 +41,17 @@ The pass scans the homepage, then follows up to eight same-site links ranked
 as contact, staff, team, leadership, management, people, or directory pages.
 It extracts normal `mailto:` links, visible text, structured JSON-LD, common
 `[at]`/`[dot]` obfuscation, and Cloudflare's public email obfuscation. Set
-`--staff-page-limit N` to tune that bounded scan. Existing records are not
-rescanned; running the pass again removes only legacy `source_url` keys from
-older `Staff Emails` JSON output.
+`--staff-page-limit N` to tune that bounded scan. The default rerun retries
+empty rows and cleans invalid addresses/misleading metadata in populated
+rows, without discarding valid prior addresses. Add `--staff-refresh-generic`
+to revisit populated rows that have no named contact and merge any new
+findings with their valid existing emails. `staff-refresh` in the worker
+launcher selects that mode. Rows with named contacts remain skipped.
+
+The scan diagnostics distinguish fetch failures, contact forms, named staff
+without public email, and empty listings. A staff page that lists people but
+publishes no email cannot yield a verified staff address; the crawler does not
+guess one from a person's name or the dealership domain.
 
 For a broader pass over integrations that are injected by JavaScript or only
 exist on a vehicle-detail page, use deep detection. It opens a browser for the

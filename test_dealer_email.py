@@ -98,6 +98,108 @@ class StaffEmailExtractionTests(unittest.TestCase):
     def test_prose_is_not_mistaken_for_obfuscated_email(self) -> None:
         self.assertEqual(extract_staff_email_records("<p>Schedule service at our shop when convenient.</p>"), [])
 
+    def test_louisiana_prose_domains_are_rejected_but_real_mail_is_kept(self) -> None:
+        bad = [
+            "find@our.we", "day@home.we", "phone@0.you", "credit@all.used",
+            "here@navarre.apply", "privacy@hudsonauto.com.if",
+            "ford@j.allen", "right@home.as", "feel@home.my",
+        ]
+        source = json.dumps([{"email": email, "name": ""} for email in bad] + [
+            {"email": "sales@dealer.com", "name": ""},
+            {"email": "person@dealer.you", "name": ""},
+        ])
+        cleaned, removed, _ = clean_staff_email_records(source)
+        self.assertEqual(removed, len(bad))
+        self.assertEqual([record["email"] for record in json.loads(cleaned)], [
+            "sales@dealer.com", "person@dealer.you",
+        ])
+        self.assertEqual(extract_staff_email_records("<p>find@our.we and sales@dealer.com</p>"), [
+            {"email": "sales@dealer.com", "name": "", "role": ""},
+        ])
+        self.assertEqual(extract_staff_email_records('<a href="mailto:privacy@dealerinspire.com">Privacy</a>'), [])
+        self.assertEqual(extract_staff_email_records(
+            '<a href="mailto:sales@hixsonalexandria.edealerhub.com">Sales</a>'
+        ), [{"email": "sales@hixsonalexandria.edealerhub.com", "name": "", "role": ""}])
+
+    def test_cleanup_clears_page_headings_and_names_used_as_roles(self) -> None:
+        source = json.dumps([
+            {"email": "sales@dealer.com", "name": "About Cajun Autos", "role": "About Cajun Autos"},
+            {"email": "jordan@dealer.com", "name": "Jordan Lee", "role": "Jordan Lee"},
+            {"email": "avery@dealer.com", "name": "Avery Kim", "role": "Jordan Lee"},
+            {"email": "manager@dealer.com", "name": "Morgan Hale", "role": "General Manager"},
+        ])
+        cleaned, removed, cleared = clean_staff_email_records(source)
+        self.assertEqual((removed, cleared), (0, 4))
+        self.assertEqual(json.loads(cleaned), [
+            {"email": "sales@dealer.com", "name": "", "role": ""},
+            {"email": "jordan@dealer.com", "name": "Jordan Lee", "role": ""},
+            {"email": "avery@dealer.com", "name": "Avery Kim", "role": ""},
+            {"email": "manager@dealer.com", "name": "Morgan Hale", "role": "General Manager"},
+        ])
+        dealer_record = json.dumps([{
+            "email": "contact@prestigeofbr.info", "name": "PRESTIGE OF BATON ROUGE", "role": "Get In Touch"
+        }])
+        dealer_cleaned, _, dealer_cleared = clean_staff_email_records(
+            dealer_record, dealer_name="Prestige of Baton Rouge"
+        )
+        self.assertEqual(dealer_cleared, 2)
+        self.assertEqual(json.loads(dealer_cleaned)[0]["name"], "")
+
+    def test_repeated_staff_metadata_is_not_assigned_to_every_mailbox(self) -> None:
+        source = json.dumps([
+            {"email": "nbonvillain@dealer.com", "name": "Nicholas Bonvillain", "role": "Nicholas Bonvillain"},
+            {"email": "hbrown@dealer.com", "name": "Nicholas Bonvillain", "role": "Nicholas Bonvillain"},
+            {"email": "sbye@dealer.com", "name": "Nicholas Bonvillain", "role": "Nicholas Bonvillain"},
+            {"email": "hedrick.wood@dealer.com", "name": "", "role": "Hedrick Wood General Manager"},
+            {"email": "chad.martorana@dealer.com", "name": "", "role": "Hedrick Wood General Manager"},
+            {"email": "eric.metzler@dealer.com", "name": "", "role": "Hedrick Wood General Manager"},
+        ])
+        cleaned, removed, _ = clean_staff_email_records(source)
+        records = json.loads(cleaned)
+        self.assertEqual(removed, 0)
+        self.assertEqual([record["name"] for record in records[:3]], ["Nicholas Bonvillain", "", ""])
+        self.assertEqual([record["role"] for record in records[:3]], ["", "", ""])
+        self.assertEqual(records[3]["name"], "Hedrick Wood")
+        self.assertEqual(records[3]["role"], "General Manager")
+        self.assertEqual([record["role"] for record in records[4:]], ["", ""])
+
+    def test_repeated_legitimate_job_title_and_first_name_mailbox_survive_cleanup(self) -> None:
+        source = json.dumps([
+            {"email": "tony@dealer.com", "name": "Tony Palmisano", "role": "Leasing and Sales Consultant"},
+            {"email": "other@dealer.com", "name": "Tony Palmisano", "role": "Leasing and Sales Consultant"},
+            {"email": "third@dealer.com", "name": "Tony Palmisano", "role": "Leasing and Sales Consultant"},
+        ])
+        cleaned, _, _ = clean_staff_email_records(source)
+        records = json.loads(cleaned)
+        self.assertEqual(records[0]["name"], "Tony Palmisano")
+        self.assertEqual([record["name"] for record in records[1:]], ["", ""])
+        self.assertEqual([record["role"] for record in records], ["Leasing and Sales Consultant"] * 3)
+
+    def test_nested_staff_list_does_not_mix_people_or_roles(self) -> None:
+        html = """
+        <div class="staff-list">
+          <li><h3>Jordan Lee</h3><h4>General Manager</h4>
+              <a href="mailto:jordan@dealer.com">Email</a></li>
+          <li><h3>Avery Kim</h3><h4>New Car Sales Consultant</h4>
+              <a href="mailto:avery@dealer.com">Email</a></li>
+        </div>
+        """
+        self.assertEqual(extract_staff_email_records(html), [
+            {"email": "jordan@dealer.com", "name": "Jordan Lee", "role": "General Manager"},
+            {"email": "avery@dealer.com", "name": "Avery Kim", "role": "New Car Sales Consultant"},
+        ])
+
+    def test_common_surname_and_explicit_car_sales_title_are_preserved(self) -> None:
+        html = """
+        <div class="staff-card"><h3>Price LeBlanc</h3>
+          <p class="job-title">New Car Sales Consultant</p>
+          <a href="mailto:price@dealer.com">Email</a>
+        </div>
+        """
+        self.assertEqual(extract_staff_email_records(html), [
+            {"email": "price@dealer.com", "name": "Price LeBlanc", "role": "New Car Sales Consultant"},
+        ])
+
     def test_footer_email_does_not_inherit_dealership_name_or_hours(self) -> None:
         html = """<footer><h3>TEDS CAR CENTER</h3><h4>Business Hours</h4>
         <a href="mailto:teds.carcenter@yahoo.com">Email</a></footer>"""
@@ -194,6 +296,21 @@ class StaffEmailExtractionTests(unittest.TestCase):
         self.assertEqual(fetch.call_count, 1)
         self.assertEqual(records[0]["name"], "Jordan Lee")
 
+    def test_unlinked_dealeron_staff_aspx_is_probed(self) -> None:
+        site = "https://dealer.com/"
+        home = (site, "<html>Home</html>")
+        staff = (site + "staff.aspx", '<li><h3>Jordan Lee</h3><a href="mailto:jordan@dealer.com">Email</a></li>')
+        def fetch(url: str, **_: object) -> tuple[str, str] | None:
+            return staff if url.endswith("/staff.aspx") else None
+        with patch("enrich_dealers.fetch_dealer_html", return_value=home), patch(
+            "enrich_dealers._fetch_staff_page", side_effect=fetch
+        ) as page_fetch:
+            records, _, _, _, _, _ = _collect_staff_records(
+                site, timeout=1, fetch_mode="http", headed=False, page_limit=3
+            )
+        self.assertEqual(page_fetch.call_count, 3)
+        self.assertEqual(records[0]["email"], "jordan@dealer.com")
+
     def test_vendor_email_is_not_reused_as_dealer_contact(self) -> None:
         self.assertIsNone(_previous_website_email("hey@intice.com", "https://northstarauto.com"))
 
@@ -273,8 +390,68 @@ class StaffEmailExtractionTests(unittest.TestCase):
         self.assertEqual(fetch.call_args.kwargs["mode"], "browser")
         self.assertTrue(pages[-1]["browser_retry"])
 
+    def test_generic_home_email_does_not_suppress_staff_browser_retry(self) -> None:
+        site = "https://dealer.com/"
+        staff_url = site + "staff.aspx"
+        home = (site, '<a href="mailto:info@dealer.com">Email</a><a href="/staff.aspx">Meet Staff</a>')
+        staff_shell = (staff_url, '<div class="staff-card"><h3>Jordan Lee</h3><p>Manager</p></div>')
+        staff_browser = (staff_url, '<div class="staff-card"><h3>Jordan Lee</h3><p>Manager</p><a href="mailto:jordan@dealer.com">Email</a></div>')
+        with patch("enrich_dealers.fetch_dealer_html", side_effect=[home, staff_browser]) as fetch, patch(
+            "enrich_dealers._fetch_staff_page", return_value=staff_shell
+        ):
+            records, _, _, _, _, _ = _collect_staff_records(
+                site, timeout=1, fetch_mode="auto", headed=False, page_limit=1
+            )
+        self.assertEqual(fetch.call_count, 2)
+        self.assertEqual({record["email"] for record in records}, {"info@dealer.com", "jordan@dealer.com"})
+
 
 class StaffEmailOutputTests(unittest.TestCase):
+    def test_refresh_without_website_retains_prior_contact(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "source.csv"
+            output = Path(temp_dir) / "output.csv"
+            with source.open("w", newline="", encoding="utf-8") as file:
+                writer = csv.writer(file)
+                writer.writerow(["Website", "Staff Emails"])
+                writer.writerow(["", json.dumps([{"email": "sales@dealer.com", "name": "", "role": ""}])])
+            with patch("enrich_dealers._collect_staff_records") as scan:
+                enrich_staff_emails_file(source, output, website_col=None, state_col=None,
+                    threads=1, timeout=1, fetch_mode="http", refresh_generic=True)
+            with output.open(newline="", encoding="utf-8") as file:
+                row = next(csv.DictReader(file))
+        scan.assert_not_called()
+        self.assertEqual(json.loads(row["Staff Emails"])[0]["email"], "sales@dealer.com")
+        self.assertIn("no usable website URL for refresh", row["Staff Email Scan Notes"])
+
+    def test_refresh_generic_merges_new_staff_without_discarding_old_email(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "source.csv"
+            output = Path(temp_dir) / "output.csv"
+            with source.open("w", newline="", encoding="utf-8") as file:
+                writer = csv.writer(file)
+                writer.writerow(["Website", "Staff Emails", "Keep"])
+                writer.writerow(["https://dealer.com", json.dumps([
+                    {"email": "sales@dealer.com", "name": "", "role": ""},
+                ]), "unchanged"])
+                writer.writerow(["https://other.com", json.dumps([
+                    {"email": "jordan@other.com", "name": "Jordan Lee", "role": "Manager"},
+                ]), "also unchanged"])
+            new = [{"email": "avery@dealer.com", "name": "Avery Kim", "role": "General Manager"}]
+            with patch("enrich_dealers._collect_staff_records", return_value=(new, True, 2, 0, 1, "")) as scan:
+                enrich_staff_emails_file(source, output, website_col=None, state_col=None,
+                    threads=1, timeout=1, fetch_mode="http", refresh_generic=True)
+            with output.open(newline="", encoding="utf-8") as file:
+                rows = list(csv.DictReader(file))
+        scan.assert_called_once()
+        self.assertEqual([record["email"] for record in json.loads(rows[0]["Staff Emails"])], [
+            "sales@dealer.com", "avery@dealer.com",
+        ])
+        self.assertEqual(rows[0]["Staff Email Scan Status"], "Refreshed existing")
+        self.assertEqual(rows[0]["Keep"], "unchanged")
+        self.assertEqual(rows[1]["Staff Email Scan Status"], "Previously found")
+        self.assertEqual(rows[1]["Keep"], "also unchanged")
+
     def test_versioned_input_writes_to_next_version(self) -> None:
         with TemporaryDirectory() as temp_dir:
             input_dir = Path(temp_dir) / "enriched_v8"

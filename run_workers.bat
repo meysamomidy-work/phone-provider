@@ -6,12 +6,13 @@ if "%~1"=="" (
     echo   num_workers defaults to 6
     echo   threads_per_worker defaults to 2 for deep browser detection
     echo   vdp_sample_size defaults to 3
-    echo   mode: deep ^(default^), standard, or staff
-    echo   staff_page_limit defaults to 8 and applies only in staff mode
+    echo   mode: deep ^(default^), standard, staff, or staff-refresh
+    echo   staff_page_limit defaults to 8 and applies in staff modes
     echo.
     echo Examples:
     echo   run_workers.bat dealers.csv 6 2 3 deep
     echo   run_workers.bat dealers.csv 6 2 0 staff 8
+    echo   run_workers.bat enriched_v8 6 2 0 staff-refresh 8
     exit /b 1
 )
 
@@ -40,8 +41,12 @@ if /I "%MODE%"=="staff" (
     set "MODE_ARGS=--staff-emails-only --staff-page-limit %STAFF_PAGE_LIMIT%"
     set "MODE_LABEL=staff-email-only"
 )
+if /I "%MODE%"=="staff-refresh" (
+    set "MODE_ARGS=--staff-emails-only --staff-refresh-generic --staff-page-limit %STAFF_PAGE_LIMIT%"
+    set "MODE_LABEL=staff-email refresh"
+)
 if not defined MODE_LABEL (
-    echo Invalid mode "%MODE%". Choose deep, standard, or staff.
+    echo Invalid mode "%MODE%". Choose deep, standard, staff, or staff-refresh.
     exit /b 1
 )
 
@@ -53,3 +58,4 @@ for /L %%w in (0,1,%LAST%) do (
 echo Started %WORKERS% %MODE_LABEL% workers for "%INPUT%" ^(threads/worker: %THREADS%^)
 if /I "%MODE%"=="deep" echo VDP sample: %VDP_SAMPLE%
 if /I "%MODE%"=="staff" echo Staff-page limit: %STAFF_PAGE_LIMIT%
+if /I "%MODE%"=="staff-refresh" echo Staff-page limit: %STAFF_PAGE_LIMIT%
