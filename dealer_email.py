@@ -15,6 +15,7 @@ import re
 from html import unescape
 from html.parser import HTMLParser
 from urllib.parse import unquote, urldefrag, urljoin, urlparse
+from xml.etree import ElementTree
 
 _JSON_LD_RE = re.compile(
     r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
@@ -117,8 +118,8 @@ _PROSE_SECOND_LEVEL = frozenset({
 })
 _PROSE_AMBIGUOUS_ENDINGS = frozenset({"as", "by", "it", "my", "you"})
 _GENERIC_NAME_RE = re.compile(
-    r"^(?:how to reach us|select primary|review us|new inventory|store hours|"
-    r"search vehicles|total price|browse through our inventory|used vehicles|"
+    r"^(?:how to reach us|select (?:primary|secondary)|review us|new inventory|store hours|"
+    r"search vehicles|total price|browse through our inventory|used vehicles|find us|"
     r"we welcome your feedback and comments|contact us|learn more|read more|"
     r"how to|address\s*&|make an inquiry|leave a message below|"
     r"your options regarding marketing communications|translate website|"
@@ -128,10 +129,15 @@ _GENERIC_NAME_RE = re.compile(
     r"welcome to our dealership!?|first name(?: last name)?\s*\*?)$",
     re.I,
 )
+_BUSINESS_NAME_RE = re.compile(
+    r"\b(?:automotive|autos?|motors?|cars?|trucks?|vehicles?|dealership|group|inc|llc)\b",
+    re.I,
+)
+_SLOGAN_NAME_RE = re.compile(r"\b(?:expect|welcome|discover|shop|find|explore|experience)\b", re.I)
 _GENERIC_ROLE_RE = re.compile(
     r"(?:\bhours\b|\brequired field\b|\bhow to reach us\b|\bsearch by keyword\b|"
     r"\bmeet (?:the|our) staff\b|\bprivacy policy\b|\bjob openings\b|"
-    r"\bapply for position\b|\bget in touch\b)",
+    r"\bapply for position\b|\bget in touch\b|\bdealeron\b|^position$|^\W+$)",
     re.I,
 )
 
@@ -206,6 +212,56 @@ def _is_department_list(value: str) -> bool:
     )
 
 
+def _split_person_title(value: str) -> tuple[str, str]:
+    """Split a displayed `Name - Title` only when both sides are credible."""
+    text = _clean_text(value)
+    for separator in (" - ", " | ", f" {chr(8211)} ", f" {chr(8212)} ", ", "):
+        if separator not in text:
+            continue
+        name, role = (part.strip() for part in text.split(separator, 1))
+        one_word_name = bool(
+            re.fullmatch(r"[A-Z][a-zA-Z'-]{2,}", name)
+            and not _BUSINESS_NAME_RE.search(name)
+            and not _SLOGAN_NAME_RE.search(name)
+            and not _GENERIC_NAME_RE.fullmatch(name)
+            and not _INFERRED_JOB_WORD_RE.search(name)
+        )
+        if (_probably_name(name) or one_word_name) and _probably_role(role, inferred=True):
+            return name, role
+    return "", ""
+
+
+_DEPARTMENT_LOCAL_RE = re.compile(
+    r"^(?:sales|service|parts|finance|bodyshop|collision|reception|office|support|"
+    r"internet|baddesk|bizdev|bdc|customerservice)(?:[._-]?\d+)?$",
+    re.I,
+)
+_GENERAL_LOCAL_RE = re.compile(r"^(?:info|contact|contactus|hello|general|inquiries|mail)$", re.I)
+
+
+def classify_staff_email_records(records: list[dict[str, str]]) -> dict[str, str]:
+    """Conservative per-address category, kept outside the legacy email JSON."""
+    categories: dict[str, str] = {}
+    for record in records:
+        email = _normalize_email(str(record.get("email", "")))
+        if not email:
+            continue
+        local = email.split("@", 1)[0].split("+", 1)[0]
+        if _DEPARTMENT_LOCAL_RE.fullmatch(local):
+            kind = "department"
+        elif _GENERAL_LOCAL_RE.fullmatch(local):
+            kind = "general"
+        elif record.get("name") and (
+            _probably_name(str(record["name"]))
+            or record.get("role") and re.fullmatch(r"[A-Z][a-zA-Z'-]{2,}", str(record["name"]))
+        ):
+            kind = "person"
+        else:
+            kind = "unidentified"
+        categories[email] = kind
+    return categories
+
+
 def clean_staff_email_records(value: str, dealer_name: str = "") -> tuple[str, int, int]:
     """Conservatively clean prior JSON without discarding plausible contacts.
 
@@ -245,15 +301,35 @@ def clean_staff_email_records(value: str, dealer_name: str = "") -> tuple[str, i
             changed = True
         name = _clean_text(str(item.get("name", "")))
         role = _clean_text(str(item.get("role", "")))
+        if _probably_role(name, inferred=True) and _probably_name(role):
+            name, role = role, name
+            item["name"] = name
+            item["role"] = role
+            cleared += 2
+            changed = True
+        split_name, split_role = _split_person_title(name)
+        if split_name:
+            item["name"] = name = split_name
+            if not role:
+                item["role"] = role = split_role
+            cleared += 1
+            changed = True
         name_label = re.sub(r"[^a-z0-9]+", "", name.casefold())
         is_dealer_heading = bool(
             dealer_label and name_label == dealer_label
-            and email.split("@", 1)[0] in {
-                "info", "sales", "contact", "contactus", "hello", "office",
-                "support", "service", "parts", "general",
-            }
+            and (_BUSINESS_NAME_RE.search(name) or len(name.split()) > 3
+                 or email.split("@", 1)[0] in {"info", "sales", "contact", "contactus", "hello", "office", "support", "service", "parts", "general", "accessibility"})
         )
-        if name and (_GENERIC_NAME_RE.fullmatch(name) or is_dealer_heading):
+        is_bad_name = bool(name and (
+            _GENERIC_NAME_RE.fullmatch(name) or is_dealer_heading
+            or _SLOGAN_NAME_RE.search(name)
+            or not (_probably_name(name) or split_name == name)
+        ))
+        if is_bad_name:
+            if not role and _INFERRED_JOB_WORD_RE.search(name) and _probably_role(name, inferred=True):
+                item["role"] = role = name
+                cleared += 1
+                changed = True
             item["name"] = ""
             cleared += 1
             changed = True
@@ -261,6 +337,7 @@ def clean_staff_email_records(value: str, dealer_name: str = "") -> tuple[str, i
         if role and (
             _GENERIC_ROLE_RE.search(role)
             or _is_department_list(role)
+            or bool(dealer_label and re.sub(r"[^a-z0-9]+", "", role.casefold()) == dealer_label)
             or not name and _GENERIC_NAME_RE.fullmatch(_clean_text(str(entry.get("name", ""))))
             or not name and is_dealer_heading
             or name and role.casefold() == name.casefold()
@@ -596,6 +673,8 @@ def _probably_name(value: str) -> str:
     words = text.split()
     if not 2 <= len(words) <= 6:
         return ""
+    if _BUSINESS_NAME_RE.search(text) or _SLOGAN_NAME_RE.search(text):
+        return ""
     if any(word.lower() in {
         "contact", "email", "sales", "service", "department", "team", "staff",
         "hours", "location", "dealership", "search", "vehicles", "total",
@@ -621,7 +700,8 @@ _INFERRED_JOB_WORD_RE = re.compile(
     r"\b(?:manager|director|consultant|advisor|principal|coordinator|specialist|"
     r"technician|associate|president|owner|executive|representative|lead|agent|"
     r"sales|finance|service|parts|internet|business|accountant|receptionist|"
-    r"administrator|controller|buyer|detailer|mechanic|porter|operations|marketing)\b",
+    r"administrator|controller|buyer|detailer|mechanic|porter|operations|marketing|"
+    r"salesman|salesperson|clerk|dealer)\b",
     re.I,
 )
 
@@ -640,7 +720,7 @@ def _probably_role(value: str, *, inferred: bool = False) -> str:
         r"\b(?:manager|consultant|advisor|director|specialist|associate|representative)\b", text, re.I
     ):
         return ""
-    if inferred and not _INFERRED_JOB_WORD_RE.search(text):
+    if inferred and not (_INFERRED_JOB_WORD_RE.search(text) or re.fullmatch(r"F\s*&\s*I", text, re.I)):
         return ""
     return text
 
@@ -685,6 +765,11 @@ def _staff_metadata(node: _HtmlNode) -> tuple[str, str]:
             or candidate.attrs.get("itemprop", "").lower() == "name"
         ):
             name = _probably_name(text)
+            if not name:
+                split_name, split_role = _split_person_title(text)
+                if split_name:
+                    name = split_name
+                    role = role or split_role
         if not role and (
             _has_role_hint(candidate)
             or candidate.attrs.get("itemprop", "").lower() in {"jobtitle", "role"}
@@ -922,7 +1007,56 @@ def _site_host(url: str) -> str:
     return urlparse(url).netloc.lower().split(":", 1)[0].removeprefix("www.")
 
 
-def find_staff_page_urls(html: str, base_url: str, *, limit: int = 8) -> list[str]:
+_PROFILE_PATH_RE = re.compile(
+    r"(?:^|/)(?:staff|team|people|employees?|bios?|profiles?|team-members?)/[^/?#]+|"
+    r"(?:^|/)(?:staff|employee|profile|bio)\.(?:aspx|php|html?)\?.+",
+    re.I,
+)
+
+
+def find_sitemap_staff_urls(xml: str, base_url: str, *, limit: int = 8) -> tuple[list[str], list[str]]:
+    """Return ranked staff/contact pages and child sitemap URLs from sitemap XML."""
+    if limit <= 0 or len(xml) > 3_000_000:
+        return [], []
+    try:
+        root = ElementTree.fromstring(xml)
+    except ElementTree.ParseError:
+        return [], []
+    is_index = root.tag.lower().endswith("sitemapindex")
+    pages: dict[str, int] = {}
+    indexes: list[str] = []
+    for element in root.iter():
+        if not element.tag.lower().endswith("loc") or not element.text:
+            continue
+        absolute, _ = urldefrag(urljoin(base_url, element.text.strip()))
+        parsed = urlparse(absolute)
+        if parsed.scheme not in {"http", "https"} or _site_host(absolute) != _site_host(base_url):
+            continue
+        if is_index:
+            if parsed.path.lower().endswith(".xml"):
+                indexes.append(absolute)
+            continue
+        path = parsed.path.lower()
+        if _NON_PAGE_SUFFIX_RE.search(absolute):
+            continue
+        score = 0
+        if re.search(r"staff|team|employee|bio|people|leadership|directory", path):
+            score += 5
+        if re.search(r"contact|about-us|who-we-are", path):
+            score += 2
+        if _PROFILE_PATH_RE.search(path):
+            score += 2
+        if score:
+            pages[absolute] = max(score, pages.get(absolute, 0))
+    ranked = [url for url, _ in sorted(pages.items(), key=lambda pair: (-pair[1], pair[0]))]
+    indexes.sort(key=lambda url: (
+        0 if re.search(r"staff|team|people|employee|bio|contact", urlparse(url).path, re.I) else 1,
+        url,
+    ))
+    return ranked[:limit], indexes[:2]
+
+
+def find_staff_page_urls(html: str, base_url: str, *, limit: int = 8, profile_links: bool = False) -> list[str]:
     """Find same-site contact, staff, team, and leadership pages from a home page.
 
     Links are ranked rather than relying on one exact URL naming convention.
@@ -951,9 +1085,12 @@ def find_staff_page_urls(html: str, base_url: str, *, limit: int = 8) -> list[st
         label = _clean_text(re.sub(r"<[^>]+>", " ", inner))
         attributes_text = _clean_text(re.sub(r"\s+", " ", attributes))
         haystack = f"{parsed.path} {parsed.query} {label} {attributes_text}".lower()
-        if not _STAFF_LINK_RE.search(haystack):
+        is_profile = profile_links and bool(_PROFILE_PATH_RE.search(f"{parsed.path}?{parsed.query}"))
+        if not (_STAFF_LINK_RE.search(haystack) or is_profile):
             continue
         score = 0
+        if is_profile:
+            score += 6
         if re.search(r"staff|team|meet|bio|leadership|management|directory|people|employee|associate", haystack, re.I):
             score += 4
         if re.search(r"contact", haystack, re.I):

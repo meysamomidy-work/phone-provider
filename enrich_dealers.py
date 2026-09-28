@@ -37,8 +37,10 @@ from dealer_email import (
     extract_primary_email,
     extract_staff_email_records,
     find_staff_page_urls,
+    find_sitemap_staff_urls,
     inspect_staff_page,
     merge_staff_email_records,
+    classify_staff_email_records,
 )
 from dealer_phone import extract_primary_phone
 from dealer_platforms import DEALER_PLATFORMS
@@ -47,6 +49,7 @@ from dealer_fetch import (
     FetchMode,
     fetch_dealer_html,
     fetch_dealer_html_with_resources,
+    fetch_sitemap_xml,
     normalize_dealer_url,
 )
 from website_provider import detect_from_html
@@ -96,6 +99,7 @@ OUTPUT_STAFF_EMAIL_STATUS_COL = "Staff Email Scan Status"
 OUTPUT_STAFF_EMAIL_NOTES_COL = "Staff Email Scan Notes"
 OUTPUT_STAFF_EMAIL_PAGES_COL = "Staff Email Scan Pages"
 OUTPUT_STAFF_EMAILS_COL = "Staff Emails"
+OUTPUT_STAFF_EMAIL_TYPES_COL = "Staff Email Types"
 OUTPUT_CHAT_WIDGET_COL = "Chat Widget"
 OUTPUT_360_VIEWER_COL = "360° Vehicle Viewer"
 OUTPUT_CUSTOMER_AI_COL = "Customer AI"
@@ -133,7 +137,7 @@ REASON_EMAIL_NOT_FOUND = "Email address not found on website"
 
 SUPPORTED_INPUT_SUFFIXES = frozenset({".xlsx", ".xlsm", ".xls", ".csv"})
 DEFAULT_CSV_SEP = ","
-ENRICHED_OUTPUT_DIR = "enriched_v8"
+ENRICHED_OUTPUT_DIR = "enriched_v9"
 
 _VDP_PATH_HINTS = re.compile(
     r"(?:/vehicle|/inventory|/vdp(?:/|$)|/details?(?:/|$)|/cars-for-sale|/used-|/new-)",
@@ -829,11 +833,13 @@ def _staff_output_columns(df: pd.DataFrame, staff_email_col: str) -> list[str]:
         columns.append(OUTPUT_STAFF_EMAIL_NOTES_COL)
     if OUTPUT_STAFF_EMAIL_PAGES_COL not in columns:
         columns.append(OUTPUT_STAFF_EMAIL_PAGES_COL)
+    if OUTPUT_STAFF_EMAIL_TYPES_COL not in columns:
+        columns.append(OUTPUT_STAFF_EMAIL_TYPES_COL)
     return columns
 
 
 _STAFF_PAGE_PATH_RE = re.compile(
-    r"(?:^|/)(?:staff|our[-_]staff|team|our[-_]team|meet[-_](?:our[-_])?(?:staff|team)|bios?|employees?|people)(?:[/.]|$)",
+    r"(?:^|/)(?:staff|our[-_]staff|team|our[-_]team|meet[-_](?:our[-_])?(?:staff|team)|bios?|employees?|people|profiles?|team-members?)(?:[/.]|$)",
     re.I,
 )
 
@@ -906,9 +912,31 @@ def _collect_staff_records(
         mode=fetch_mode,
         headed=headed,
     )
+    failed_home_urls: list[str] = []
+    if not homepage:
+        failed_home_urls.append(base)
+        # Some legacy dealer URLs only answer on HTTP or on the other www
+        # spelling. Keep this fallback bounded and HTTP-only: a browser per
+        # variant would make failed sites disproportionately expensive.
+        if fetch_mode in {FetchMode.AUTO.value, FetchMode.HTTP.value}:
+            parsed_base = urlparse(base)
+            other_scheme = "http" if parsed_base.scheme == "https" else "https"
+            host = parsed_base.netloc
+            other_host = host[4:] if host.lower().startswith("www.") else "www." + host
+            for alternate in (
+                f"{other_scheme}://{host}/",
+                f"{parsed_base.scheme}://{other_host}/",
+            ):
+                homepage = fetch_dealer_html(
+                    alternate, timeout=min(timeout, 10.0),
+                    mode=FetchMode.HTTP.value, headed=headed,
+                )
+                if homepage:
+                    break
+                failed_home_urls.append(alternate)
     records: list[dict[str, str]] = []
     pages_scanned = 0
-    pages_failed = 0 if homepage else 1
+    pages_failed = len(failed_home_urls)
     staff_pages_scanned = 0
     named_staff_email_found = False
     redirected_host = ""
@@ -926,8 +954,8 @@ def _collect_staff_records(
         if final_host and final_host != original_host:
             redirected_host = final_host
         queue.extend(find_staff_page_urls(homepage_html, homepage_url, limit=page_limit))
-    else:
-        details.append({"requested_url": base, "result": "fetch failed"})
+    for failed_url in failed_home_urls:
+        details.append({"requested_url": failed_url, "result": "fetch failed", "phase": "homepage"})
 
     # Some dealers publish /about-us/staff/ or /dealership/staff.htm but do
     # not link it from the homepage. Probe these when no useful staff page
@@ -936,14 +964,35 @@ def _collect_staff_records(
         "/about-us/staff/", "/dealership/staff.htm", "/staff.aspx",
         "/our-staff", "/bios", "/staff/", "/meet-our-team/",
     )
-    direct_added = False
+    discovery_stage = 0
     while page_limit > 0 and len(seen_urls) - bool(homepage) < page_limit:
         if not queue:
-            if direct_added or named_staff_email_found:
+            if named_staff_email_found:
                 break
             direct_base = homepage[0] if homepage else base
-            queue.extend(urljoin(direct_base, path) for path in (direct_paths if homepage else direct_paths[:3]))
-            direct_added = True
+            if discovery_stage == 0:
+                queue.extend(urljoin(direct_base, path) for path in (direct_paths[:5] if homepage else direct_paths[:3]))
+            elif discovery_stage == 1:
+                sitemap_url = urljoin(direct_base, "/sitemap.xml")
+                sitemap_xml = fetch_sitemap_xml(sitemap_url, timeout=timeout)
+                discovered: list[str] = []
+                children: list[str] = []
+                if sitemap_xml:
+                    discovered, children = find_sitemap_staff_urls(sitemap_xml, sitemap_url, limit=page_limit)
+                    for child in children:
+                        child_xml = fetch_sitemap_xml(child, timeout=timeout)
+                        if child_xml:
+                            child_urls, _ = find_sitemap_staff_urls(child_xml, child, limit=page_limit)
+                            discovered.extend(child_urls)
+                details.append({"requested_url": sitemap_url, "result": "sitemap discovery", "found": len(set(discovered)), "loaded": bool(sitemap_xml)})
+                queue.extend(url for url in dict.fromkeys(discovered) if url.rstrip("/") not in seen_urls)
+            elif discovery_stage == 2 and homepage:
+                queue.extend(urljoin(direct_base, path) for path in direct_paths[5:])
+            else:
+                break
+            discovery_stage += 1
+            if not queue:
+                continue
         page_url = queue.pop(0)
         canonical = page_url.rstrip("/")
         if canonical in seen_urls:
@@ -975,7 +1024,7 @@ def _collect_staff_records(
             named_staff_email_found = True
         # An About/Contact page may expose a staff link absent from the home
         # navigation. Follow it without expanding to an unbounded site crawl.
-        for found in find_staff_page_urls(page_html, final_url, limit=page_limit):
+        for found in find_staff_page_urls(page_html, final_url, limit=page_limit, profile_links=_is_staff_page(final_url)):
             if found.rstrip("/") not in seen_urls and found not in queue:
                 queue.append(found)
 
@@ -1283,6 +1332,13 @@ def enrich_staff_emails_file(
                 note += f" {browser_retries} browser retry result(s)."
             if redirected_host:
                 note += f" Homepage redirected to {redirected_host}."
+            sitemap_checks = [page for page in pages if page.get("result") == "sitemap discovery"]
+            if sitemap_checks:
+                sitemap_check = sitemap_checks[-1]
+                note += (
+                    f" Sitemap {'loaded' if sitemap_check.get('loaded') else 'unavailable'}; "
+                    f"{sitemap_check.get('found', 0)} candidate URL(s) found."
+                )
             if idx in cleanup_notes:
                 note += " " + cleanup_notes[idx]
             page_json = json.dumps(pages, ensure_ascii=False, separators=(",", ":"))
@@ -1333,6 +1389,12 @@ def enrich_staff_emails_file(
             row[OUTPUT_STAFF_EMAIL_STATUS_COL] = scan_status.get(idx, "Scan not completed")
             row[OUTPUT_STAFF_EMAIL_NOTES_COL] = scan_notes.get(idx, "Staff-email scan not completed.")
             row[OUTPUT_STAFF_EMAIL_PAGES_COL] = scan_page_json.get(idx, "[]")
+            try:
+                staff_records = json.loads(results.get(idx, "[]"))
+                kinds = classify_staff_email_records(staff_records) if isinstance(staff_records, list) else {}
+            except (TypeError, json.JSONDecodeError):
+                kinds = {}
+            row[OUTPUT_STAFF_EMAIL_TYPES_COL] = json.dumps(kinds, ensure_ascii=False, separators=(",", ":"))
             writer.append(row)
     finally:
         writer.close()

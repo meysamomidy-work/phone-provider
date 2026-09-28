@@ -11,6 +11,7 @@ import re
 import time
 from enum import Enum
 from urllib.parse import urljoin, urlparse
+from urllib.request import Request, urlopen
 
 log = logging.getLogger("dealer_fetch")
 
@@ -139,6 +140,23 @@ def normalize_dealer_url(url: str) -> str | None:
     if not parsed.netloc:
         return None
     return f"{parsed.scheme}://{parsed.netloc}{parsed.path or '/'}".rstrip("/") + "/"
+
+
+def fetch_sitemap_xml(url: str, *, timeout: float = 12.0) -> str | None:
+    """Fetch a small public sitemap without treating XML as HTML or opening a browser."""
+    try:
+        request = Request(url, headers={"User-Agent": CHROME_UA, "Accept": "application/xml,text/xml,*/*;q=0.5"})
+        with urlopen(request, timeout=min(timeout, 12.0)) as response:
+            final = response.geturl()
+            if response.status != 200 or (urlparse(final).hostname or "").removeprefix("www.") != (urlparse(url).hostname or "").removeprefix("www."):
+                return None
+            content = response.read(3_000_001)
+            if len(content) > 3_000_000:
+                return None
+            return content.decode("utf-8-sig", errors="replace")
+    except Exception as exc:
+        log.debug("sitemap fetch failed %s: %s", url, exc)
+        return None
 
 
 def _origin_paths(base_url: str, paths: tuple[str, ...]) -> list[str]:

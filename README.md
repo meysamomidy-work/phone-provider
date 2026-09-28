@@ -14,7 +14,7 @@ running the other enrichers, use `--staff-emails-only`. The source file is
 never edited: a versioned `enriched_vN/` input writes to `enriched_v(N+1)/`
 by default (or to `-o` for one file). All unrelated source columns are retained.
 The pass writes `Staff Emails`, `Staff Email Scan Status`,
-`Staff Email Scan Notes`, and `Staff Email Scan Pages`.
+`Staff Email Scan Notes`, `Staff Email Scan Pages`, and `Staff Email Types`.
 
 ```powershell
 python enrich_dealers.py ..\google-maps\enriched_new\dealers.csv `
@@ -37,6 +37,11 @@ context together, for example:
 [{"email":"jordan@dealer.com","name":"Jordan Lee","role":"General Manager"}]
 ```
 
+`Staff Email Types` is a separate JSON map from address to `person`,
+`department`, `general`, or `unidentified`. The last category means the
+address is public but its owner could not be verified; it is not assumed to
+belong to a staff member. The `Staff Emails` JSON does not contain a source URL.
+
 The pass scans the homepage, then follows up to eight same-site links ranked
 as contact, staff, team, leadership, management, people, or directory pages.
 It extracts normal `mailto:` links, visible text, structured JSON-LD, common
@@ -47,6 +52,12 @@ rows, without discarding valid prior addresses. Add `--staff-refresh-generic`
 to revisit populated rows that have no named contact and merge any new
 findings with their valid existing emails. `staff-refresh` in the worker
 launcher selects that mode. Rows with named contacts remain skipped.
+When normal links and common staff paths do not yield a named staff address,
+the crawler checks a bounded same-site sitemap and follows profile links from
+staff listings. A failed homepage also gets two HTTP-only hostname/scheme
+variants. Candidate HTML pages remain within the staff-page limit, and sitemap
+attempts are recorded in the scan diagnostics. Sitemap requests and homepage
+retries have their own small fixed bounds.
 
 The scan diagnostics distinguish fetch failures, contact forms, named staff
 without public email, and empty listings. A staff page that lists people but

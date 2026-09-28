@@ -8,7 +8,7 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
-from dealer_email import clean_staff_email_records, extract_emails_from_html, extract_staff_email_records, find_staff_page_urls, inspect_staff_page
+from dealer_email import clean_staff_email_records, classify_staff_email_records, extract_emails_from_html, extract_staff_email_records, find_sitemap_staff_urls, find_staff_page_urls, inspect_staff_page
 from enrich_dealers import _collect_staff_records, _enriched_output_root, _previous_website_email, enrich_staff_emails_file
 
 
@@ -239,6 +239,60 @@ class StaffEmailExtractionTests(unittest.TestCase):
         ])
         self.assertEqual(clean_staff_email_records('[{"email":"person@dealer.you"}]')[1], 0)
 
+    def test_louisiana_business_names_placeholders_and_combined_titles_are_repaired(self) -> None:
+        source = json.dumps([
+            {"email": "mlacoste@supremeauto.net", "name": "Expect More From Supreme Automotive Group", "role": ""},
+            {"email": "brettcaz3214@yahoo.com", "name": "Cazenave Motor Co Inc", "role": ""},
+            {"email": "banzalone@supremeauto.net", "name": "*First Name", "role": ""},
+            {"email": "robert@acadianadodge.com", "name": "Automotive Lube Technician", "role": ""},
+            {"email": "justin@carroway.com", "name": "Justin Carroway - Dealer", "role": ""},
+            {"email": "lauren@carroway.com", "name": "Lauren Carroway - Dealer", "role": ""},
+        ])
+        cleaned, removed, _ = clean_staff_email_records(source, dealer_name="Cazenave Motor Co Inc")
+        records = json.loads(cleaned)
+        self.assertEqual(removed, 0)
+        self.assertEqual([record["name"] for record in records], ["", "", "", "", "Justin Carroway", "Lauren Carroway"])
+        self.assertEqual(records[3]["role"], "Automotive Lube Technician")
+        self.assertEqual([record["role"] for record in records[-2:]], ["Dealer", "Dealer"])
+
+    def test_email_types_distinguish_verified_person_and_unidentified_address(self) -> None:
+        self.assertEqual(classify_staff_email_records([
+            {"email": "jordan@dealer.com", "name": "Jordan Lee", "role": "Manager"},
+            {"email": "sales@dealer.com", "name": "", "role": ""},
+            {"email": "info@dealer.com", "name": "", "role": ""},
+            {"email": "abc123@dealer.com", "name": "", "role": ""},
+        ]), {
+            "jordan@dealer.com": "person", "sales@dealer.com": "department",
+            "info@dealer.com": "general", "abc123@dealer.com": "unidentified",
+        })
+
+    def test_legitimate_brand_or_job_word_surnames_survive_and_swapped_fields_repair(self) -> None:
+        source = json.dumps([
+            {"email": "jford@dealer.com", "name": "Juan Ford", "role": "Sales Consultant"},
+            {"email": "rporter@dealer.com", "name": "Ricky Porter", "role": "Business Manager"},
+            {"email": "rmalhiet@dealer.com", "name": "Shop Manager", "role": "Robert Malhiet"},
+        ])
+        cleaned, _, _ = clean_staff_email_records(source)
+        self.assertEqual(json.loads(cleaned), [
+            {"email": "jford@dealer.com", "name": "Juan Ford", "role": "Sales Consultant"},
+            {"email": "rporter@dealer.com", "name": "Ricky Porter", "role": "Business Manager"},
+            {"email": "rmalhiet@dealer.com", "name": "Robert Malhiet", "role": "Shop Manager"},
+        ])
+
+    def test_single_name_title_and_finance_abbreviation_are_split(self) -> None:
+        source = json.dumps([
+            {"email": "salsmotors@yahoo.com", "name": "Sal - Owner", "role": ""},
+            {"email": "brittany@dealer.com", "name": "Brittany - Office Manager", "role": ""},
+            {"email": "elissanava@dealer.com", "name": "Elissa Nava - F & I", "role": ""},
+        ])
+        cleaned, _, _ = clean_staff_email_records(source)
+        self.assertEqual([(item["name"], item["role"]) for item in json.loads(cleaned)], [
+            ("Sal", "Owner"), ("Brittany", "Office Manager"), ("Elissa Nava", "F & I"),
+        ])
+        self.assertEqual(extract_staff_email_records(
+            '<div class="staff-card"><h3>Sal - Owner</h3><a href="mailto:sal@dealer.com">Email</a></div>'
+        ), [{"email": "sal@dealer.com", "name": "Sal", "role": "Owner"}])
+
     def test_page_signals_distinguish_staff_list_form_and_empty_listing(self) -> None:
         self.assertEqual(
             inspect_staff_page('<div class="staff-card"><h3>Jordan Lee</h3><h4>Manager</h4></div>').named_staff,
@@ -276,6 +330,66 @@ class StaffEmailExtractionTests(unittest.TestCase):
             find_staff_page_urls('<a href="/bios">Our Bios</a>', "https://northstarauto.com/"),
             ["https://northstarauto.com/bios"],
         )
+
+    def test_sitemap_discovery_is_same_site_and_ranks_staff_pages(self) -> None:
+        sitemap = """<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+          <url><loc>https://dealer.com/inventory</loc></url>
+          <url><loc>https://dealer.com/team/jordan-lee</loc></url>
+          <url><loc>https://dealer.com/about-us/staff/</loc></url>
+          <url><loc>https://other.com/staff</loc></url>
+        </urlset>"""
+        urls, indexes = find_sitemap_staff_urls(sitemap, "https://dealer.com/sitemap.xml")
+        self.assertEqual(urls, ["https://dealer.com/about-us/staff/", "https://dealer.com/team/jordan-lee"])
+        self.assertEqual(indexes, [])
+
+    def test_sitemap_index_prioritizes_staff_child_and_ignores_external_child(self) -> None:
+        index = """<sitemapindex>
+          <sitemap><loc>https://dealer.com/inventory.xml</loc></sitemap>
+          <sitemap><loc>https://other.com/staff.xml</loc></sitemap>
+          <sitemap><loc>https://dealer.com/staff.xml</loc></sitemap>
+          <sitemap><loc>https://dealer.com/pages.xml</loc></sitemap>
+        </sitemapindex>"""
+        urls, children = find_sitemap_staff_urls(index, "https://dealer.com/sitemap.xml")
+        self.assertEqual(urls, [])
+        self.assertEqual(children, ["https://dealer.com/staff.xml", "https://dealer.com/inventory.xml"])
+
+    def test_staff_page_follows_profile_link_without_email_on_listing(self) -> None:
+        site = "https://dealer.com/"
+        home = (site, '<a href="/staff/">Meet Our Staff</a>')
+        listing = (site + "staff/", '<div class="staff-card"><h3>Jordan Lee</h3><a href="/profile/jordan-lee">View Profile</a></div>')
+        profile = (site + "profile/jordan-lee", '<article><h3>Jordan Lee</h3><h4>Sales Manager</h4><a href="mailto:jordan@dealer.com">Email</a></article>')
+        with patch("enrich_dealers.fetch_dealer_html", return_value=home), patch(
+            "enrich_dealers._fetch_staff_page", side_effect=[listing, profile]
+        ):
+            records, _, _, _, _, _ = _collect_staff_records(site, timeout=1, fetch_mode="http", headed=False, page_limit=2)
+        self.assertEqual(records, [{"email": "jordan@dealer.com", "name": "Jordan Lee", "role": "Sales Manager"}])
+
+    def test_sitemap_fallback_finds_unlinked_staff_page(self) -> None:
+        site = "https://dealer.com/"
+        home = (site, "<html>Home</html>")
+        xml = '<urlset><url><loc>https://dealer.com/people/jordan-lee</loc></url></urlset>'
+        profile = (site + "people/jordan-lee", '<article><h3>Jordan Lee</h3><h4>Manager</h4><a href="mailto:jordan@dealer.com">Email</a></article>')
+        def fetch(url: str, **_: object) -> tuple[str, str] | None:
+            return profile if url == profile[0] else None
+        pages: list[dict[str, object]] = []
+        with patch("enrich_dealers.fetch_dealer_html", return_value=home), patch(
+            "enrich_dealers._fetch_staff_page", side_effect=fetch
+        ), patch("enrich_dealers.fetch_sitemap_xml", return_value=xml):
+            records, _, _, _, _, _ = _collect_staff_records(site, timeout=1, fetch_mode="http", headed=False, page_limit=6, scan_pages=pages)
+        self.assertEqual(records[0]["email"], "jordan@dealer.com")
+        self.assertEqual([page["result"] for page in pages if page["result"] == "sitemap discovery"], ["sitemap discovery"])
+
+    def test_failed_https_homepage_tries_bounded_http_fallback(self) -> None:
+        site = "https://dealer.com/"
+        http_home = ("http://dealer.com/", '<a href="mailto:sales@dealer.com">Email</a>')
+        with patch("enrich_dealers.fetch_dealer_html", side_effect=[None, http_home]) as fetch:
+            records, loaded, _, failed, _, _ = _collect_staff_records(
+                site, timeout=1, fetch_mode="http", headed=False, page_limit=0
+            )
+        self.assertTrue(loaded)
+        self.assertEqual(failed, 1)
+        self.assertEqual(records[0]["email"], "sales@dealer.com")
+        self.assertEqual(fetch.call_args.args[0], "http://dealer.com/")
 
     def test_unlinked_staff_path_is_probed_within_page_limit(self) -> None:
         home = ("https://northstarauto.com/", "<html><body>Home</body></html>")
@@ -599,11 +713,12 @@ class StaffEmailOutputTests(unittest.TestCase):
 
         self.assertEqual(
             list(rows[0]),
-            ["Process ID", "Dealer Name", "Website", "Existing Value", "Staff Emails", "Staff Email Scan Status", "Staff Email Scan Notes", "Staff Email Scan Pages"],
+            ["Process ID", "Dealer Name", "Website", "Existing Value", "Staff Emails", "Staff Email Scan Status", "Staff Email Scan Notes", "Staff Email Scan Pages", "Staff Email Types"],
         )
         self.assertEqual(rows[0]["Process ID"], "11")
         self.assertEqual(rows[0]["Existing Value"], "keep me")
         self.assertEqual(json.loads(rows[0]["Staff Emails"]), discovered)
+        self.assertEqual(json.loads(rows[0]["Staff Email Types"]), {"jordan.lee@northstarauto.com": "person"})
         self.assertEqual(rows[1]["Existing Value"], "also keep")
         self.assertEqual(rows[1]["Staff Emails"], "[]")
         self.assertEqual(rows[1]["Staff Email Scan Status"], "No website")
