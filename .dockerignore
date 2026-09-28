@@ -1,0 +1,16 @@
+.git
+.env
+.env.*
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.csv
+*.xls
+*.xlsx
+*.xlsm
+*.zip
+*.ipynb
+*.log
+*.bat
+enriched*/
+docker-output/

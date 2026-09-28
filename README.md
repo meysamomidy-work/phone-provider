@@ -7,6 +7,27 @@ email, chat, dealer-type, 360° viewer, and customer-AI fields.
 python enrich_dealers.py ..\google-maps\enriched_new -t 6 --fetch-mode auto
 ```
 
+## Run on a fresh Linux VM with Docker
+
+Install Docker Engine with the Compose plugin, copy this `phone-provider` folder
+to the VM, and put the input CSV/XLSX inside it (for example,
+`enriched_v8/Louisiana.csv`). From the `phone-provider` directory, run one
+command:
+
+```bash
+docker compose run --build --rm --user "$(id -u):$(id -g)" dealer-enrichment \
+  /input/enriched_v8/Louisiana.csv --staff-emails-only -t 2 --fetch-mode auto
+```
+
+This builds the image on first use, including Python dependencies and Chromium.
+The source folder is mounted read-only at `/input`; outputs are written to the
+host's `docker-output/` folder. For this example, the result is
+`docker-output/enriched_v9/Louisiana.csv`. Change the `/input/...` path and
+script flags in the same command for another file or mode. The UID/GID option
+keeps output files owned by the Linux user who ran Docker. Browser runs are
+headless in the container; do not pass `--browser-headed` without adding a
+display server. Docker does not bypass site CAPTCHA or IP restrictions.
+
 ## Staff-email-only enrichment
 
 To extend an existing dealer file with public contact/staff emails without

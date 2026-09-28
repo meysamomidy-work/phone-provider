@@ -1,0 +1,14 @@
+services:
+  dealer-enrichment:
+    build: .
+    image: phone-provider:local
+    init: true
+    shm_size: "1gb"
+    volumes:
+      - type: bind
+        source: .
+        target: /input
+        read_only: true
+      - type: bind
+        source: ./docker-output
+        target: /output

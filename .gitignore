@@ -221,3 +221,7 @@ excels
 *.ipynb
 *.csv
 *.zip
+
+# Docker runs write outputs here; keep only the mount-point placeholder.
+/docker-output/*
+!/docker-output/.gitkeep
