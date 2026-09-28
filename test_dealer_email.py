@@ -289,9 +289,18 @@ class StaffEmailExtractionTests(unittest.TestCase):
         self.assertEqual([(item["name"], item["role"]) for item in json.loads(cleaned)], [
             ("Sal", "Owner"), ("Brittany", "Office Manager"), ("Elissa Nava", "F & I"),
         ])
+        self.assertEqual(clean_staff_email_records(cleaned), (cleaned, 0, 0))
         self.assertEqual(extract_staff_email_records(
             '<div class="staff-card"><h3>Sal - Owner</h3><a href="mailto:sal@dealer.com">Email</a></div>'
         ), [{"email": "sal@dealer.com", "name": "Sal", "role": "Owner"}])
+
+    def test_single_word_navigation_label_is_not_preserved_as_person(self) -> None:
+        source = json.dumps([
+            {"email": "sales@dealer.com", "name": "Home", "role": "Sales Manager"},
+            {"email": "info@dealer.com", "name": "Select", "role": "Owner"},
+        ])
+        cleaned, _, _ = clean_staff_email_records(source)
+        self.assertEqual([record["name"] for record in json.loads(cleaned)], ["", ""])
 
     def test_page_signals_distinguish_staff_list_form_and_empty_listing(self) -> None:
         self.assertEqual(

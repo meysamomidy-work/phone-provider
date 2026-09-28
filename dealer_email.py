@@ -212,6 +212,27 @@ def _is_department_list(value: str) -> bool:
     )
 
 
+_NON_PERSON_SINGLE_WORDS = frozenset({
+    "about", "contact", "dealer", "finance", "home", "inventory", "management",
+    "menu", "office", "owner", "parts", "sales", "select", "service", "staff",
+    "team", "view",
+})
+
+
+def _probably_single_name(value: str, role: str) -> bool:
+    """Allow a mononym only when it accompanies a credible job title."""
+    name = _clean_text(value)
+    return bool(
+        re.fullmatch(r"[A-Z][a-zA-Z'-]{2,}", name)
+        and name.casefold() not in _NON_PERSON_SINGLE_WORDS
+        and not _BUSINESS_NAME_RE.search(name)
+        and not _SLOGAN_NAME_RE.search(name)
+        and not _GENERIC_NAME_RE.fullmatch(name)
+        and not _INFERRED_JOB_WORD_RE.search(name)
+        and _probably_role(role, inferred=True)
+    )
+
+
 def _split_person_title(value: str) -> tuple[str, str]:
     """Split a displayed `Name - Title` only when both sides are credible."""
     text = _clean_text(value)
@@ -219,14 +240,7 @@ def _split_person_title(value: str) -> tuple[str, str]:
         if separator not in text:
             continue
         name, role = (part.strip() for part in text.split(separator, 1))
-        one_word_name = bool(
-            re.fullmatch(r"[A-Z][a-zA-Z'-]{2,}", name)
-            and not _BUSINESS_NAME_RE.search(name)
-            and not _SLOGAN_NAME_RE.search(name)
-            and not _GENERIC_NAME_RE.fullmatch(name)
-            and not _INFERRED_JOB_WORD_RE.search(name)
-        )
-        if (_probably_name(name) or one_word_name) and _probably_role(role, inferred=True):
+        if (_probably_name(name) or _probably_single_name(name, role)) and _probably_role(role, inferred=True):
             return name, role
     return "", ""
 
@@ -253,7 +267,7 @@ def classify_staff_email_records(records: list[dict[str, str]]) -> dict[str, str
             kind = "general"
         elif record.get("name") and (
             _probably_name(str(record["name"]))
-            or record.get("role") and re.fullmatch(r"[A-Z][a-zA-Z'-]{2,}", str(record["name"]))
+            or _probably_single_name(str(record["name"]), str(record.get("role", "")))
         ):
             kind = "person"
         else:
@@ -323,7 +337,7 @@ def clean_staff_email_records(value: str, dealer_name: str = "") -> tuple[str, i
         is_bad_name = bool(name and (
             _GENERIC_NAME_RE.fullmatch(name) or is_dealer_heading
             or _SLOGAN_NAME_RE.search(name)
-            or not (_probably_name(name) or split_name == name)
+            or not (_probably_name(name) or _probably_single_name(name, role))
         ))
         if is_bad_name:
             if not role and _INFERRED_JOB_WORD_RE.search(name) and _probably_role(name, inferred=True):
